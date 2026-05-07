@@ -32,6 +32,25 @@ class AutoPolicy(StrEnum):
     BALANCED = "balanced"
 
 
+class SeedOrigin(StrEnum):
+    """Provenance of the persisted Seed for an auto session.
+
+    ``auto_pipeline`` marks a Seed produced by ``AutoPipeline.run()`` itself.
+    ``none`` means no Seed has been persisted yet for this session — the
+    schema default for legacy state files is also ``none`` and the pipeline
+    backfills ``auto_pipeline`` once on first post-PR resume of a session
+    that already had a ``seed_artifact`` or ``seed_path``.
+
+    Additional provenance values (e.g. for Seeds attached via a side-channel
+    ``ouroboros_generate_seed`` writer) are intentionally deferred until the
+    matching producer path lands; introducing an enum value without a writer
+    creates a public contract that the runtime cannot honor.
+    """
+
+    NONE = "none"
+    AUTO_PIPELINE = "auto_pipeline"
+
+
 DEFAULT_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     AutoPhase.INTERVIEW.value: 120,
     AutoPhase.SEED_GENERATION.value: 120,
@@ -190,6 +209,7 @@ class AutoPipelineState:
     interview_completed: bool = False
     seed_id: str | None = None
     seed_path: str | None = None
+    seed_origin: SeedOrigin = SeedOrigin.NONE
     seed_artifact: dict[str, Any] = field(default_factory=dict)
     execution_id: str | None = None
     job_id: str | None = None
@@ -294,6 +314,7 @@ class AutoPipelineState:
         data = asdict(self)
         data["phase"] = self.phase.value
         data["policy"] = self.policy.value
+        data["seed_origin"] = self.seed_origin.value
         return data
 
     @classmethod
@@ -315,6 +336,7 @@ class AutoPipelineState:
         payload.setdefault("run_reconciled_at", None)
         payload.setdefault("provenance", None)
         payload.setdefault("auto_answer_log", [])
+        payload.setdefault("seed_origin", SeedOrigin.NONE.value)
         required_fields = {item.name for item in fields(cls)}
         missing_fields = sorted(required_fields - payload.keys())
         if missing_fields:
@@ -322,6 +344,11 @@ class AutoPipelineState:
             raise ValueError(msg)
         payload["phase"] = AutoPhase(payload["phase"])
         payload["policy"] = AutoPolicy(payload["policy"])
+        try:
+            payload["seed_origin"] = SeedOrigin(payload["seed_origin"])
+        except ValueError as exc:
+            msg = f"seed_origin must be one of {[item.value for item in SeedOrigin]}"
+            raise ValueError(msg) from exc
         state = cls(**payload)
         state._validate_loaded()
         return state

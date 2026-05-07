@@ -250,6 +250,7 @@ def _result_meta(result: AutoPipelineResult) -> dict[str, Any]:
         "resume_command": f"ooo auto --resume {result.auto_session_id}",
         "blocker": result.blocker,
         "seed_path": result.seed_path,
+        "seed_origin": result.seed_origin,
         "grade": result.grade,
         "last_grade": result.last_grade,
         "interview_session_id": result.interview_session_id,
@@ -444,6 +445,7 @@ def _format_result(result: AutoPipelineResult) -> str:
         lines.append(f"Interview session: {result.interview_session_id}")
     if result.seed_path:
         lines.append(f"Seed: {result.seed_path}")
+    lines.append(f"Seed origin: {result.seed_origin}")
     if result.job_id or result.execution_id or result.run_session_id:
         lines.extend(
             [

@@ -12,7 +12,13 @@ from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.ledger import SeedDraftLedger
 from ouroboros.auto.seed_repairer import SeedRepairer
 from ouroboros.auto.seed_reviewer import SeedReview, SeedReviewer
-from ouroboros.auto.state import AutoPhase, AutoPipelineState, AutoStore, utc_now_iso
+from ouroboros.auto.state import (
+    AutoPhase,
+    AutoPipelineState,
+    AutoStore,
+    SeedOrigin,
+    utc_now_iso,
+)
 from ouroboros.core.seed import Seed
 
 SeedGenerator = Callable[[str], Awaitable[Seed]]
@@ -30,6 +36,7 @@ class AutoPipelineResult:
     phase: str
     grade: str | None = None
     seed_path: str | None = None
+    seed_origin: str = SeedOrigin.NONE.value
     interview_session_id: str | None = None
     execution_id: str | None = None
     job_id: str | None = None
@@ -93,6 +100,13 @@ class AutoPipeline:
                 _mark_invalid_seed_artifact(state, f"persisted Seed artifact is invalid: {exc}")
                 self._save(state)
                 return self._result(state, ledger, blocker=state.last_error)
+            # Backfill legacy resumed sessions: pre-PR auto pipelines were the
+            # only writer of state.seed_artifact, so a valid persisted Seed
+            # paired with seed_origin=none can only have come from this
+            # pipeline. Inferring it once on resume keeps the new contract
+            # accurate for sessions created before this field existed.
+            if state.seed_origin is SeedOrigin.NONE:
+                state.seed_origin = SeedOrigin.AUTO_PIPELINE
         self._save(state)
 
         if self.reconcile_run and state.phase == AutoPhase.COMPLETE:
@@ -194,6 +208,7 @@ class AutoPipeline:
                         raise TypeError(msg)
                     state.seed_id = seed.metadata.seed_id
                     state.seed_artifact = seed.to_dict()
+                    state.seed_origin = SeedOrigin.AUTO_PIPELINE
                 except TimeoutError as exc:
                     state.mark_blocked(
                         f"seed generation timed out after {self.seed_timeout_seconds:.0f}s",
@@ -409,6 +424,15 @@ class AutoPipeline:
             )
             self._save(state)
             return None
+        # Loader-based resume paths previously left ``seed_origin`` at the
+        # legacy default ``none`` even though a Seed had clearly been
+        # persisted by an earlier auto pipeline run (the Seed file at
+        # ``seed_path`` was written by ``seed_saver``). Backfill the
+        # provenance once on first post-PR resume so the new CLI/MCP
+        # surfaces don't keep reporting an inaccurate ``none`` for valid
+        # resumed sessions. Existing non-default values are preserved.
+        if state.seed_origin is SeedOrigin.NONE:
+            state.seed_origin = SeedOrigin.AUTO_PIPELINE
         return seed
 
     def _result(
@@ -427,6 +451,7 @@ class AutoPipeline:
             phase=state.phase.value,
             grade=review.grade_result.grade.value if review else state.last_grade,
             seed_path=state.seed_path,
+            seed_origin=state.seed_origin.value,
             interview_session_id=state.interview_session_id,
             execution_id=state.execution_id,
             job_id=state.job_id,
@@ -563,6 +588,11 @@ class AutoPipeline:
 
 def _mark_invalid_seed_artifact(state: AutoPipelineState, message: str) -> None:
     state.seed_artifact = {}
+    # Keep seed_origin consistent with the now-empty seed_artifact: the
+    # session no longer has a persisted Seed of any provenance, so the
+    # publicly surfaced "auto_pipeline" / "external_authoring" claim
+    # would otherwise become a misleading orphan attribution.
+    state.seed_origin = SeedOrigin.NONE
     if state.phase in {AutoPhase.COMPLETE, AutoPhase.BLOCKED, AutoPhase.FAILED}:
         now = utc_now_iso()
         state.phase = AutoPhase.FAILED
