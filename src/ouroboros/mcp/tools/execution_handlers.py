@@ -889,7 +889,23 @@ class ExecuteSeedHandler(BridgeAwareMixin):
 
 @dataclass
 class StartExecuteSeedHandler:
-    """Start a seed execution asynchronously and return a job ID immediately."""
+    """Start a seed execution asynchronously and return a job ID immediately.
+
+    Idempotency contract (Q00/ouroboros#774):
+
+    Callers may pass an ``idempotency_key`` argument. The handler maintains
+    an in-memory ``dict[str, ExecutionMeta]`` keyed by ``idempotency_key``.
+    On a second call with the same key, the handler returns the original
+    execution metadata (``job_id`` / ``session_id`` / ``execution_id``) and
+    does NOT enqueue a new background execution. Different keys produce
+    independent executions.
+
+    **Non-goal**: persistence across server restarts. The map TTL is the
+    process lifetime; on restart the key map is empty and a duplicate
+    request *can* enqueue a new execution. This is an intentional scope
+    bound — auto-side state recovery on the same restart will surface
+    the duplicate. See the issue for the full rationale.
+    """
 
     execute_handler: ExecuteSeedHandler | None = field(default=None, repr=False)
     event_store: EventStore | None = field(default=None, repr=False)
@@ -905,6 +921,23 @@ class StartExecuteSeedHandler:
             agent_runtime_backend=self.agent_runtime_backend,
             opencode_mode=self.opencode_mode,
         )
+        # Process-lifetime idempotency map: idempotency_key -> tool result
+        # meta dict. Entries are added once on first call and reused on
+        # subsequent calls with the same key.
+        self._idempotency_meta: dict[str, dict[str, Any]] = {}
+        # Parallel cache for plugin-dispatch entries — stores the original
+        # SubagentPayload + response_shape so a retry re-emits an identical
+        # ``_subagent`` envelope without triggering a second
+        # subagent_dispatched event.  Keyed by idempotency_key.
+        self._idempotency_plugin_payload: dict[str, dict[str, Any]] = {}
+        # Per-key serialization lock so two concurrent handle() calls with
+        # the same idempotency_key dedupe correctly. Without this, both
+        # callers can miss the cache (entries are written *after* dispatch)
+        # and each enqueues a fresh execution. ``dict.setdefault`` is
+        # atomic in single-threaded asyncio so the lock-creation path is
+        # race-free; the lock is held across the cache check + dispatch +
+        # cache write so the second caller observes a populated cache.
+        self._idempotency_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def definition(self) -> MCPToolDefinition:
@@ -920,13 +953,78 @@ class StartExecuteSeedHandler:
                 "This is the handler for 'ooo run' commands — "
                 "do NOT run 'ooo' in the shell; call this MCP tool instead."
             ),
-            parameters=ExecuteSeedHandler().definition.parameters,
+            parameters=(
+                *ExecuteSeedHandler().definition.parameters,
+                MCPToolParameter(
+                    name="idempotency_key",
+                    type=ToolInputType.STRING,
+                    description=(
+                        "Optional process-local idempotency key. A second call with the same "
+                        "key returns the same execution metadata and does NOT enqueue a new "
+                        "execution. Map TTL is process lifetime — not persistent across "
+                        "server restarts."
+                    ),
+                    required=False,
+                ),
+            ),
         )
 
     async def handle(
         self,
         arguments: dict[str, Any],
     ) -> Result[MCPToolResult, MCPServerError]:
+        # Serialize concurrent calls with the same idempotency_key so the
+        # check-cache / dispatch / write-cache sequence is atomic per key.
+        # Without this, two in-flight requests can both miss the cache and
+        # each enqueue a fresh execution, breaking the "second call with
+        # the same key does not enqueue" contract. ``setdefault`` is
+        # atomic in single-threaded asyncio (no ``await`` between the
+        # ``in`` check and insert), so lock-creation is race-free.
+        raw_key_outer = arguments.get("idempotency_key")
+        idem_key_outer = raw_key_outer.strip() if isinstance(raw_key_outer, str) else ""
+        if idem_key_outer:
+            lock = self._idempotency_locks.setdefault(idem_key_outer, asyncio.Lock())
+            async with lock:
+                return await self._handle_inner(arguments)
+        return await self._handle_inner(arguments)
+
+    async def _handle_inner(
+        self,
+        arguments: dict[str, Any],
+    ) -> Result[MCPToolResult, MCPServerError]:
+        # Idempotency short-circuit: if this exact key was previously
+        # served, return the same metadata without enqueuing another
+        # execution. The map is process-local; see class docstring.
+        raw_key = arguments.get("idempotency_key")
+        idempotency_key = raw_key.strip() if isinstance(raw_key, str) else ""
+        if idempotency_key and idempotency_key in self._idempotency_plugin_payload:
+            # Plugin-dispatch replay: re-emit an identical ``_subagent``
+            # envelope using the cached payload + response_shape, but do NOT
+            # emit another subagent_dispatched event (the original first call
+            # already recorded it).  This preserves the public response_shape
+            # contract on retries with the same idempotency_key.
+            cached = self._idempotency_plugin_payload[idempotency_key]
+            return build_subagent_result(
+                cached["payload"],
+                response_shape=dict(cached["response_shape"]),
+            )
+        if idempotency_key and idempotency_key in self._idempotency_meta:
+            cached_meta = dict(self._idempotency_meta[idempotency_key])
+            text = (
+                "Replayed prior background execution via idempotency key.\n\n"
+                f"Idempotency Key: {idempotency_key}\n"
+                f"Job ID: {cached_meta.get('job_id') or 'pending'}\n"
+                f"Session ID: {cached_meta.get('session_id') or 'pending'}\n"
+                f"Execution ID: {cached_meta.get('execution_id') or 'pending'}\n"
+            )
+            return Result.ok(
+                MCPToolResult(
+                    content=(MCPContentItem(type=ContentType.TEXT, text=text),),
+                    is_error=False,
+                    meta=cached_meta,
+                )
+            )
+
         cwd_result = ExecuteSeedHandler._resolve_dispatch_cwd_result(
             arguments.get("cwd"), tool_name="ouroboros_start_execute_seed"
         )
@@ -993,17 +1091,24 @@ class StartExecuteSeedHandler:
             # callers would see "completed" while the child is still running.
             # Instead we return job_id=None with an explicit status so no one
             # accidentally polls a non-existent job.
-            return build_subagent_result(
-                payload,
-                response_shape={
-                    "job_id": None,
-                    "session_id": plugin_session_id,
-                    "execution_id": None,
-                    "status": "delegated_to_plugin",
-                    "dispatch_mode": "plugin",
-                    "runtime_backend": self.agent_runtime_backend,
-                },
-            )
+            response_shape: dict[str, Any] = {
+                "job_id": None,
+                "session_id": plugin_session_id,
+                "execution_id": None,
+                "status": "delegated_to_plugin",
+                "dispatch_mode": "plugin",
+                "runtime_backend": self.agent_runtime_backend,
+            }
+            # Cache for idempotent replay: a second handle() with the same
+            # key must NOT re-dispatch (no second subagent_dispatched event)
+            # but MUST return an identical response_shape — same contract as
+            # the non-plugin path's ``_idempotency_meta`` short-circuit.
+            if idempotency_key:
+                self._idempotency_plugin_payload[idempotency_key] = {
+                    "payload": payload,
+                    "response_shape": dict(response_shape),
+                }
+            return build_subagent_result(payload, response_shape=response_shape)
 
         # Fall-through: real background job path — build payload here where
         # session_id may still be None (background path generates its own).
@@ -1098,18 +1203,21 @@ class StartExecuteSeedHandler:
             "Use ouroboros_ac_tree_hud(session_id, cursor) for live progress and "
             "ouroboros_job_result(job_id) for the final output."
         )
+        meta: dict[str, Any] = {
+            "job_id": snapshot.job_id,
+            "session_id": snapshot.links.session_id,
+            "execution_id": snapshot.links.execution_id,
+            "status": snapshot.status.value,
+            "cursor": snapshot.cursor,
+            "runtime_backend": runtime_backend,
+            "llm_backend": llm_backend,
+        }
+        if idempotency_key:
+            self._idempotency_meta[idempotency_key] = dict(meta)
         return Result.ok(
             MCPToolResult(
                 content=(MCPContentItem(type=ContentType.TEXT, text=text),),
                 is_error=False,
-                meta={
-                    "job_id": snapshot.job_id,
-                    "session_id": snapshot.links.session_id,
-                    "execution_id": snapshot.links.execution_id,
-                    "status": snapshot.status.value,
-                    "cursor": snapshot.cursor,
-                    "runtime_backend": runtime_backend,
-                    "llm_backend": llm_backend,
-                },
+                meta=meta,
             )
         )
