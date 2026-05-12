@@ -24,6 +24,26 @@ class AutoPhase(StrEnum):
     RALPH_HANDOFF = "ralph_handoff"
     EVALUATE = "evaluate"
     UNSTUCK_LATERAL = "unstuck_lateral"
+    # RFC #809 Phase 2.2 originally specified a third recovery phase
+    # ``SEED_REGENERATE`` that would re-enter SEED_GENERATION with a
+    # ``[lateral_repair]`` ledger entry, automatically rewriting the Seed's
+    # acceptance criteria when persona lateral also failed. P2.2b
+    # deliberately does NOT wire this phase: an automatic AC rewrite when
+    # the run cannot satisfy the user's stated bar is a reward-hacking
+    # surface (the system silently downgrades the spec the user explicitly
+    # agreed to in the interview, then declares success against the
+    # downgraded spec). Ouroboros's spec-first invariant — "define what
+    # should be built before telling AI what to build" — keeps the spec
+    # owned by the human. P2.2b instead exhausts the deterministic
+    # recovery budget (rounds + fingerprint + persona-once + wall-clock)
+    # and surfaces a BLOCKED with the two operator choices that are
+    # actually functional today (re-interview, abandon) rather than
+    # mutating the Seed. An earlier draft of this comment advertised a
+    # third "relax AC" path; that was dropped because late-phase resume
+    # reconstructs the Seed from ``state.seed_artifact`` and ignores
+    # edits to the on-disk seed file — the cue in ``pipeline.py``
+    # (``_RECOVERY_BLOCKED_CHOICES``) is the source of truth and lists
+    # only the two functional paths.
     COMPLETE = "complete"
     BLOCKED = "blocked"
     FAILED = "failed"
@@ -64,6 +84,35 @@ DEFAULT_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
     AutoPhase.EVALUATE.value: 90,
     AutoPhase.UNSTUCK_LATERAL.value: 60,
 }
+
+# RFC #809 Phase 2.2b — closed-loop recovery cap. Three EVALUATE rounds is
+# the SeedRepairer convention re-applied to the EVALUATE ⇄ UNSTUCK_LATERAL
+# retry cycle. Past three rounds the failure mode is structural rather
+# than a transient grading miss; the pipeline blocks for human review
+# (with the two functional operator choices documented at
+# ``_RECOVERY_BLOCKED_CHOICES`` in ``pipeline.py``: re-interview or
+# abandon) instead of burning more LLM budget or — worse — silently
+# rewriting the Seed (see the SEED_REGENERATE deferral comment on
+# ``AutoPhase``).
+MAX_EVALUATE_ROUNDS: int = 3
+
+# RFC #809 Phase 2.2b — closed allowlists for the durable recovery-loop
+# fields. ``_validate_loaded`` rejects any state file whose persisted
+# values fall outside these sets so a hand-edited or corrupted
+# checkpoint surfaces a clean ValueError at load time instead of a
+# delayed runtime crash deep inside ``_run_evaluate`` /
+# ``_run_lateral``. ``_VALID_RECOVERY_PERSONAS`` mirrors
+# ``ouroboros.resilience.lateral.ThinkingPersona.value``; duplicated as
+# string literals to keep ``state.py`` independent of the resilience
+# module's import graph (state has no other dependency on resilience).
+# ``_VALID_RECOVERY_GUARD_TAGS`` mirrors the tags written by the three
+# guard sites in ``pipeline.py``.
+_VALID_RECOVERY_PERSONAS: frozenset[str] = frozenset(
+    {"hacker", "architect", "researcher", "simplifier", "contrarian"}
+)
+_VALID_RECOVERY_GUARD_TAGS: frozenset[str] = frozenset(
+    {"round_budget", "duplicate_fingerprint", "personas_exhausted"}
+)
 
 # Top-level pipeline deadline (Q00/ouroboros#779). Default of 7200s (2h) covers
 # a typical product-bootstrap chain — interview ≤ 120s × 12 rounds + seed gen
@@ -215,7 +264,16 @@ _ALLOWED_TRANSITIONS: dict[AutoPhase, set[AutoPhase]] = {
         AutoPhase.BLOCKED,
         AutoPhase.FAILED,
     },
+    # RFC #809 Phase 2.2b — UNSTUCK_LATERAL is no longer a terminal advisory
+    # phase. It now dispatches one of two outcomes inside the bounded
+    # retry budget: back to EVALUATE for another round under a different
+    # persona, or BLOCKED when a recovery guard trips
+    # (``MAX_EVALUATE_ROUNDS``, duplicate failure fingerprint, persona
+    # exhaustion, or wall-clock budget). SEED_REGENERATE is deliberately
+    # not part of this set — see the ``AutoPhase`` comment block above for
+    # the spec-first rationale behind that omission.
     AutoPhase.UNSTUCK_LATERAL: {
+        AutoPhase.EVALUATE,
         AutoPhase.COMPLETE,
         AutoPhase.BLOCKED,
         AutoPhase.FAILED,
@@ -395,6 +453,39 @@ class AutoPipelineState:
     last_lateral_approach_summary: str | None = None
     last_lateral_text: str | None = None
     lateral_input_hash: str | None = None
+    # RFC #809 Phase 2.2b — closed-loop recovery counters. Persisted so a
+    # resumed session does not re-roll the budget after a process restart.
+    #
+    # ``evaluate_round`` counts entries into the EVALUATE phase (post-Ralph
+    # or post-SEED_REGENERATE). ``MAX_EVALUATE_ROUNDS`` (3) caps the loop.
+    #
+    # ``failure_fingerprints`` accumulates a deterministic fingerprint of
+    # each EVALUATE failure (sha256 over differences + suggestions). Two
+    # consecutive identical fingerprints means the recovery loop is not
+    # making material progress on the failure surface, so the pipeline
+    # transitions to BLOCKED rather than spending another LLM budget cycle.
+    #
+    # ``personas_invoked`` lists ``ThinkingPersona.value`` strings of every
+    # persona already routed in this session. The lateral router skips
+    # personas already in this list and finally returns ``None`` (no
+    # persona left to try) when all five are exhausted, which the pipeline
+    # treats as BLOCKED.
+    evaluate_round: int = 0
+    failure_fingerprints: list[str] = field(default_factory=list)
+    personas_invoked: list[str] = field(default_factory=list)
+    # RFC #809 Phase 2.2b — sticky "guard tripped" flag. Set to a short
+    # tag identifying *which* recovery guard exhausted the budget the
+    # first time one of them blocked the pipeline (one of
+    # ``"round_budget"``, ``"duplicate_fingerprint"``, ``"personas_exhausted"``).
+    # ``_run_evaluate`` and ``_run_lateral`` both inspect this on entry
+    # so a ``--resume`` after a guard-driven BLOCKED does NOT re-enter
+    # the cache-fast-path or spend another persona slot — the surface
+    # had been declared exhausted, and silently un-exhausting it would
+    # undermine the guard contract. Cleared only on a successful
+    # forward transition out of the recovery loop (e.g. COMPLETE), so a
+    # fresh artifact reaching EVALUATE through a deliberate operator
+    # workflow can start over with a clean budget.
+    recovery_guard_tripped: str | None = None
 
     def phase_timeout_seconds(self, phase: AutoPhase) -> float:
         """Return the configured timeout for ``phase`` in seconds.
@@ -538,6 +629,16 @@ class AutoPipelineState:
         from ouroboros.auto.pipeline import _recoverable_phase_for_tool  # noqa: PLC0415
 
         if self.phase == AutoPhase.COMPLETE:
+            return AutoResumeCapability.NONE
+
+        # RFC #809 Phase 2.2b — a session whose recovery guard has tripped
+        # cannot make forward progress on --resume. ``_run_evaluate`` and
+        # ``_run_lateral`` both short-circuit to BLOCKED immediately when
+        # ``recovery_guard_tripped`` is set; advertising the session as
+        # resumable in this state would be a user-facing contract bug
+        # (CLI/MCP status surfaces would tell the operator "you can
+        # --resume" when --resume produces an identical blocker).
+        if self.recovery_guard_tripped is not None:
             return AutoResumeCapability.NONE
 
         if self.phase not in {AutoPhase.BLOCKED, AutoPhase.FAILED}:
@@ -721,6 +822,15 @@ class AutoPipelineState:
         payload.setdefault("last_lateral_text", None)
         payload.setdefault("lateral_input_hash", None)
         payload.setdefault("active_domain_profile_name", None)
+        # RFC #809 Phase 2.2b — closed-loop recovery counters. Default the
+        # three new fields so a pre-P2.2b state file loads as a fresh
+        # recovery budget (round 0, no fingerprints, no personas tried).
+        # Without these setdefaults a legacy resume would raise the
+        # "state is missing required fields" guard below.
+        payload.setdefault("evaluate_round", 0)
+        payload.setdefault("failure_fingerprints", [])
+        payload.setdefault("personas_invoked", [])
+        payload.setdefault("recovery_guard_tripped", None)
         # Convert the persisted ``deadline_at_epoch`` (epoch seconds) back into
         # a monotonic-clock value usable from this process. If the companion
         # epoch field is present, derive ``deadline_at`` from the offset
@@ -942,6 +1052,41 @@ class AutoPipelineState:
             not isinstance(self.lateral_input_hash, str) or not self.lateral_input_hash.strip()
         ):
             msg = "lateral_input_hash must be a non-empty string or null"
+            raise ValueError(msg)
+        # RFC #809 Phase 2.2b — recovery-loop field validation. These four
+        # fields are durable state; once malformed they would crash deep
+        # inside ``_run_evaluate`` (``state.evaluate_round += 1`` on a
+        # string) or ``_run_lateral`` (``ThinkingPersona(value)`` on a
+        # bogus persona). Reject at load time instead.
+        if (
+            isinstance(self.evaluate_round, bool)
+            or not isinstance(self.evaluate_round, int)
+            or self.evaluate_round < 0
+        ):
+            msg = "evaluate_round must be a non-negative integer"
+            raise ValueError(msg)
+        if not isinstance(self.failure_fingerprints, list) or any(
+            not isinstance(item, str) or not item.strip() for item in self.failure_fingerprints
+        ):
+            msg = "failure_fingerprints must be a list of non-empty strings"
+            raise ValueError(msg)
+        if not isinstance(self.personas_invoked, list) or any(
+            not isinstance(item, str) or item not in _VALID_RECOVERY_PERSONAS
+            for item in self.personas_invoked
+        ):
+            msg = (
+                "personas_invoked entries must be ThinkingPersona values "
+                f"({sorted(_VALID_RECOVERY_PERSONAS)})"
+            )
+            raise ValueError(msg)
+        if self.recovery_guard_tripped is not None and (
+            not isinstance(self.recovery_guard_tripped, str)
+            or self.recovery_guard_tripped not in _VALID_RECOVERY_GUARD_TAGS
+        ):
+            msg = (
+                "recovery_guard_tripped must be one of "
+                f"{sorted(_VALID_RECOVERY_GUARD_TAGS)} or null"
+            )
             raise ValueError(msg)
         if self.provenance is not None:
             if not isinstance(self.provenance, dict):

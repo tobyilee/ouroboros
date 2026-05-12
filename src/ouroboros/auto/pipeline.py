@@ -33,6 +33,7 @@ from ouroboros.auto.progress import AutoProgressCallback, AutoProgressEvent
 from ouroboros.auto.seed_repairer import SeedRepairer
 from ouroboros.auto.seed_reviewer import SeedReview, SeedReviewer
 from ouroboros.auto.state import (
+    MAX_EVALUATE_ROUNDS,
     AutoPhase,
     AutoPipelineState,
     AutoResumeCapability,
@@ -41,6 +42,47 @@ from ouroboros.auto.state import (
     utc_now_iso,
 )
 from ouroboros.core.seed import Seed
+from ouroboros.resilience.lateral import ThinkingPersona
+
+# RFC #809 Phase 2.2b — Stack 1 of 2 scope and invariants.
+#
+# **Scope of this module's recovery wiring.** P2.2b lands in two stacked
+# PRs. This file is Stack 1: the deterministic *guards* and *multi-persona
+# advisory* path. There is intentionally no automated Ralph re-dispatch
+# here — when EVALUATE fails, ``_run_lateral`` records the persona's
+# advisory and the session ends in ``BLOCKED``. The four guards
+# (``MAX_EVALUATE_ROUNDS``, same-fingerprint twice, per-persona-once,
+# ``state.deadline_at``) bound the surface so a future Stack 2, which
+# wires the lateral advice into a fresh Ralph job and a new EVALUATE
+# round, cannot loop unboundedly or revisit a stale persona. Without
+# Stack 2 present, ``evaluate_round`` typically increments to 1 in a
+# single session and the fingerprint guard is exercised only on
+# ``--resume`` against the same artifact; both become load-bearing once
+# Stack 2 lands. Naming this PR a "closed loop" was a documentation
+# overstatement caught in code review; the loop *closes* when Stack 2
+# ships, and Stack 1 is the bounded-advisory step that makes Stack 2
+# safe to land.
+#
+# **Operator-choice cue.** Suffixed onto every recovery-loop BLOCKED
+# message so the operator sees their next move without having to read
+# the rest of the surface. Two explicit choices, intentionally avoiding
+# any "let the system rewrite the spec" option: keep the spec contract
+# under human control.
+#
+# Earlier drafts of this cue advertised a third path ("relax AC via --resume
+# + edited seed"). That guidance was wrong: ``AutoPipeline.run()`` resumes
+# late-phase blockers (EVALUATE / UNSTUCK_LATERAL) by reconstructing the
+# Seed from ``state.seed_artifact``, which is always populated on the
+# normal auto path. Editing the on-disk ``state.seed_path`` file therefore
+# has no effect — the next resume re-grades against the same in-state AC
+# and loops back to the identical blocker. Until the resume contract is
+# changed to honor a freshly-edited seed file on late-phase resume (a
+# separate PR with its own end-to-end coverage), only two operator paths
+# are actually functional, and the cue must say so.
+_RECOVERY_BLOCKED_CHOICES: str = (
+    "next: (1) re-interview with a refined goal (the in-state Seed cannot "
+    "be edited mid-session); (2) abandon this session"
+)
 
 SeedGenerator = Callable[[str], Awaitable[Seed]]
 
@@ -1375,6 +1417,16 @@ class AutoPipeline:
         """
         assert self.evaluator is not None  # noqa: S101 — guarded by caller
 
+        # Capture the prior round's score BEFORE any subsequent step
+        # mutates ``state.last_qa_score`` — specifically the cache
+        # invalidation below (``state.last_qa_score = None`` when the
+        # artifact hash changes). The duplicate-fingerprint guard later
+        # in this method needs the genuine previous score to decide
+        # whether "same wording" was accompanied by score progress
+        # (bot review #8 fix). First-ever round has ``None`` here,
+        # which the guard treats as "cannot judge progress" and skips.
+        previous_qa_score = state.last_qa_score
+
         # Resolve the artifact:
         # 1. Fresh call from the Ralph terminal path → use ``ralph_result_text``
         #    (``is not None`` so an empty-but-valid artifact still grades)
@@ -1393,6 +1445,55 @@ class AutoPipeline:
             artifact_hash = state.evaluate_artifact_hash
         else:
             artifact_hash = hashlib.sha256(artifact.encode("utf-8")).hexdigest()
+
+        # RFC #809 Phase 2.2b — fresh-artifact reset. A new run output
+        # (artifact_hash differs from the persisted one) means the
+        # failure surface changed; any prior recovery exhaustion no
+        # longer applies and must be cleared BEFORE the sticky-guard
+        # check below — otherwise ``recovery_guard_tripped`` would be a
+        # permanent poison pill that no operator-driven workflow could
+        # escape within the same session. The reset is conditional on
+        # ``state.evaluate_artifact_hash`` already being populated so
+        # the first evaluator call of a session does not trip it on
+        # default-None state. This is the same "fresh artifact = fresh
+        # budget" contract the ``recovery_guard_tripped`` field
+        # docstring on AutoPipelineState promises; Stack 2's automated
+        # re-dispatch will be the most common producer of fresh
+        # artifacts arriving at EVALUATE.
+        if (
+            state.evaluate_artifact_hash is not None
+            and artifact_hash is not None
+            and state.evaluate_artifact_hash != artifact_hash
+        ):
+            state.recovery_guard_tripped = None
+            state.evaluate_round = 0
+            state.failure_fingerprints = []
+            state.personas_invoked = []
+
+        # RFC #809 Phase 2.2b — sticky guard check (post-reset). If the
+        # previous round exhausted a recovery guard AND the artifact
+        # has not changed, this resume MUST NOT re-enter the
+        # cache-fast-path or fall through to ``_finalize_evaluate``:
+        # doing so would honour a cached ``passed=False`` verdict and
+        # spend another lateral persona slot for a surface already
+        # declared exhausted. Re-mark the session BLOCKED (the
+        # ``--resume`` transition above flipped the phase back to
+        # EVALUATE for re-entry; flip it back) and surface the
+        # original exhaustion reason verbatim.
+        if state.recovery_guard_tripped is not None:
+            state.mark_blocked(
+                state.last_error
+                or f"recovery guard '{state.recovery_guard_tripped}' already exhausted",
+                tool_name=state.last_tool_name or "evaluator",
+            )
+            self._save(state)
+            return self._result(
+                state,
+                ledger,
+                review=review,
+                blocker=state.last_error,
+                run_subagent=run_subagent,
+            )
 
         # Cache hit requires the persisted ``last_qa_passed`` boolean — the
         # canonical pass decision derived from ``score >= pass_threshold``
@@ -1464,6 +1565,28 @@ class AutoPipeline:
             state.lateral_input_hash = None
         state.evaluate_artifact = artifact
         state.evaluate_artifact_hash = artifact_hash
+
+        # RFC #809 Phase 2.2b — recovery-loop round budget guard. Check
+        # BEFORE the evaluator call; the counter is incremented AFTER a
+        # real evaluation result is in hand (post ``eval_result.error``
+        # filter, below). This split matters because transient
+        # infrastructure failures (timeout, exception, transient adapter
+        # error) must NOT consume the finite recovery budget — otherwise
+        # a streak of infra-only failures would trip ``round_budget``
+        # and permanently block a session that has not actually
+        # completed any QA round.
+        if state.evaluate_round >= MAX_EVALUATE_ROUNDS:
+            state.mark_blocked(
+                f"recovery loop: evaluate_round budget exhausted "
+                f"(MAX_EVALUATE_ROUNDS={MAX_EVALUATE_ROUNDS}); "
+                f"{_RECOVERY_BLOCKED_CHOICES}",
+                tool_name="evaluator",
+            )
+            state.recovery_guard_tripped = "round_budget"
+            self._save(state)
+            return self._result(
+                state, ledger, review=review, blocker=state.last_error, run_subagent=run_subagent
+            )
         self._save(state)
 
         phase_timeout = state.phase_timeout_seconds(AutoPhase.EVALUATE)
@@ -1515,6 +1638,13 @@ class AutoPipeline:
                 state, ledger, review=review, blocker=state.last_error, run_subagent=run_subagent
             )
 
+        # RFC #809 Phase 2.2b — only consume a round once a real QA
+        # result is in hand. Transient evaluator failures (timeout,
+        # exception, ``eval_result.error``) returned above must not
+        # decrement the recovery budget; resuming through them is part
+        # of normal infrastructure recovery, not loop progress.
+        state.evaluate_round += 1
+
         state.last_qa_score = float(eval_result.score)
         state.last_qa_verdict = str(eval_result.verdict)
         # Persist the canonical pass flag explicitly (score >= threshold
@@ -1526,6 +1656,50 @@ class AutoPipeline:
         state.last_qa_differences = list(eval_result.differences)
         state.last_qa_suggestions = list(eval_result.suggestions)
         state.evaluate_artifact_hash = artifact_hash
+
+        # RFC #809 Phase 2.2b — progress-sensitive duplicate-fingerprint
+        # guard. When two consecutive EVALUATE rounds produce the same
+        # textual failure shape, that is *evidence* of stagnation but
+        # not proof: the QA judge can return identical
+        # differences/suggestions wording on two artifacts whose
+        # numeric score materially improved (e.g. 0.30 → 0.79 while
+        # still below pass threshold). The guard therefore checks
+        # BOTH the textual fingerprint AND whether the numeric score
+        # advanced; the loop only blocks when both signals agree the
+        # session is not making progress.
+        if not bool(eval_result.passed):
+            fingerprint_input = (
+                "|".join(eval_result.differences) + "::" + "|".join(eval_result.suggestions)
+            )
+            failure_fingerprint = hashlib.sha256(fingerprint_input.encode("utf-8")).hexdigest()[:16]
+            same_text = bool(
+                state.failure_fingerprints and state.failure_fingerprints[-1] == failure_fingerprint
+            )
+            # ``previous_qa_score`` is the score from the PRIOR round
+            # captured before this round overwrote ``state.last_qa_score``.
+            # First-ever round has ``previous_qa_score is None`` and
+            # cannot trip the guard.
+            score_did_not_advance = previous_qa_score is not None and float(
+                eval_result.score
+            ) <= float(previous_qa_score)
+            if same_text and score_did_not_advance:
+                state.mark_blocked(
+                    f"recovery loop: same QA-fail fingerprint twice "
+                    f"({failure_fingerprint}) with no score progress "
+                    f"({previous_qa_score:.2f} → {eval_result.score:.2f}); "
+                    f"{_RECOVERY_BLOCKED_CHOICES}",
+                    tool_name="evaluator",
+                )
+                state.recovery_guard_tripped = "duplicate_fingerprint"
+                self._save(state)
+                return self._result(
+                    state,
+                    ledger,
+                    review=review,
+                    blocker=state.last_error,
+                    run_subagent=run_subagent,
+                )
+            state.failure_fingerprints.append(failure_fingerprint)
         self._save(state)
 
         return await self._finalize_evaluate(
@@ -1649,7 +1823,55 @@ class AutoPipeline:
 
         assert self.lateral_thinker is not None  # noqa: S101 — guarded by caller
 
-        persona = select_persona_for_qa_failure(qa_differences, qa_suggestions)
+        # RFC #809 Phase 2.2b — sticky guard check (mirrors ``_run_evaluate``).
+        # If a previous round exhausted any recovery guard, a resume that
+        # lands directly in ``UNSTUCK_LATERAL`` (via
+        # ``_recoverable_phase_for_tool("lateral_thinker")``) must not
+        # spend another persona slot or hit the lateral cache; re-mark
+        # the session BLOCKED and surface the original exhaustion
+        # blocker verbatim instead.
+        if state.recovery_guard_tripped is not None:
+            state.mark_blocked(
+                state.last_error
+                or f"recovery guard '{state.recovery_guard_tripped}' already exhausted",
+                tool_name=state.last_tool_name or "lateral_thinker",
+            )
+            self._save(state)
+            return self._result(
+                state,
+                ledger,
+                review=review,
+                blocker=state.last_error,
+                run_subagent=run_subagent,
+            )
+
+        # RFC #809 Phase 2.2b — exclude personas already routed in this
+        # session so a resumed --resume picks a different angle rather
+        # than re-emitting the same advice. Each persisted string is a
+        # ``ThinkingPersona.value``; map back through the enum so an
+        # unrecognized legacy value raises explicitly instead of
+        # silently disabling the exclusion guard.
+        already_tried: tuple[ThinkingPersona, ...] = tuple(
+            ThinkingPersona(value) for value in state.personas_invoked
+        )
+        persona = select_persona_for_qa_failure(
+            qa_differences, qa_suggestions, already_tried_personas=already_tried
+        )
+        if persona is None:
+            # All five personas exhausted across this session. No further
+            # persona-driven reframing is available; surface the operator
+            # choices so the human resolves the spec instead.
+            state.mark_blocked(
+                f"recovery loop: all lateral personas exhausted "
+                f"(tried {', '.join(state.personas_invoked) or 'none'}); "
+                f"{_RECOVERY_BLOCKED_CHOICES}",
+                tool_name="lateral_thinker",
+            )
+            state.recovery_guard_tripped = "personas_exhausted"
+            self._save(state)
+            return self._result(
+                state, ledger, review=review, blocker=state.last_error, run_subagent=run_subagent
+            )
         # Include the evaluate artifact hash in the cache key. The lateral
         # prompt's ``current_approach`` payload incorporates the run
         # artifact, so two EVALUATE rounds that grade different artifacts
@@ -1669,28 +1891,31 @@ class AutoPipeline:
         )
         input_hash = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
 
-        cache_hit = (
-            state.lateral_input_hash == input_hash
-            and state.last_lateral_text is not None
-            and state.last_lateral_persona == persona.value
-        )
-        if cache_hit:
-            return self._finalize_lateral(
-                state,
-                ledger,
-                review=review,
-                run_subagent=run_subagent,
-                qa_score=qa_score,
-                qa_verdict=qa_verdict,
-                qa_differences=qa_differences,
-                qa_suggestions=qa_suggestions,
-                cache_suffix=cache_suffix,
-                from_cache=True,
-            )
-
-        # Persist hash + persona BEFORE the call so a timeout/error path
-        # leaves a recoverable trail. The actual persona text is filled in
-        # after the call returns.
+        # RFC #809 Phase 2.2b — the P2.2 lateral cache short-circuit
+        # (input_hash match → return cached advisory) was removed here as
+        # dead code in the multi-persona world. Two factors make the
+        # short-circuit unreachable on a real resume:
+        #
+        # 1. ``state.personas_invoked`` is appended *before* the next
+        #    resume can reach this point, so ``select_persona_for_qa_failure``
+        #    deterministically picks a *different* persona than the one
+        #    whose advice was cached. The cache key includes
+        #    ``persona.value``, so a different persona always produces a
+        #    different ``input_hash`` and the cache misses.
+        # 2. The sticky ``recovery_guard_tripped`` short-circuit at the
+        #    top of this method already handles the "session was
+        #    declared exhausted, do not spend another slot" case before
+        #    cache lookup. Combined with (1) the cache path was
+        #    architectural dead weight that confused both reviewers and
+        #    operators (it implied "--resume replays the same advice"
+        #    which is the opposite of P2.2b's intent).
+        #
+        # ``input_hash`` and the persisted ``last_lateral_*`` fields
+        # remain wired so a timeout / error mid-call still leaves a
+        # recoverable trail of *which* persona+QA-shape we were
+        # processing (used by the final BLOCKED summary and by Stack 2's
+        # future re-dispatch logging), even though that trail is no
+        # longer consulted for a cache hit on the happy path.
         state.lateral_input_hash = input_hash
         state.last_lateral_persona = persona.value
         state.last_lateral_approach_summary = None
@@ -1747,6 +1972,14 @@ class AutoPipeline:
         state.last_lateral_persona = lateral_result.persona or persona.value
         state.last_lateral_approach_summary = lateral_result.approach_summary
         state.last_lateral_text = lateral_result.text
+        # RFC #809 Phase 2.2b — record the persona we just routed so the
+        # next ``_run_lateral`` (after --resume) skips it. Use the canonical
+        # ``persona.value`` (not ``lateral_result.persona``) so the
+        # exclusion set matches what ``select_persona_for_qa_failure``
+        # returns, even when the lateral handler echoes a different
+        # display name back.
+        if persona.value not in state.personas_invoked:
+            state.personas_invoked.append(persona.value)
         self._save(state)
 
         return self._finalize_lateral(
@@ -1776,7 +2009,21 @@ class AutoPipeline:
         cache_suffix: str,
         from_cache: bool,
     ) -> AutoPipelineResult:
-        """Build the BLOCKED summary that surfaces the persona's reframing."""
+        """Build the BLOCKED summary that surfaces the persona's reframing.
+
+        RFC #809 Phase 2.2b — Stack 1 of 2 endpoint. This method is the
+        *final* step of the advisory path: the persona's advice is
+        persisted in ledger/state and the session transitions to
+        BLOCKED. There is no automated Ralph re-dispatch in this PR; the
+        operator inspects the persona reframing and decides their next
+        move (the two-choice cue suffixed below). Stack 2 will replace
+        this terminal block with a Ralph re-dispatch that injects the
+        persona advice into a fresh evolve job and re-enters EVALUATE,
+        at which point the round/fingerprint/persona-once guards land
+        in their load-bearing role. The behavior here is deliberately
+        bounded so Stack 2 can layer on top without rewriting the
+        endpoint semantics.
+        """
         lateral_suffix = " [lateral cached]" if from_cache else ""
         persona_name = state.last_lateral_persona or "unknown"
         approach = state.last_lateral_approach_summary or ""
@@ -1792,6 +2039,12 @@ class AutoPipeline:
         sug_preview = "; ".join(qa_suggestions[:3]) if qa_suggestions else ""
         if sug_preview:
             summary_parts.append(f"suggestions: {sug_preview}")
+        # RFC #809 Phase 2.2b — surface the operator-choice cue alongside
+        # the persona's advisory so a session that BLOCKED here points the
+        # operator at the next move (re-interview / abandon, as advertised
+        # by ``_RECOVERY_BLOCKED_CHOICES``) rather than leaving them
+        # parsing the QA differences in isolation.
+        summary_parts.append(_RECOVERY_BLOCKED_CHOICES)
         state.mark_blocked("; ".join(summary_parts), tool_name="lateral_thinker")
         self._save(state)
         return self._result(
