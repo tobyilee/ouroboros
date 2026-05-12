@@ -53,6 +53,7 @@ from ouroboros.evolution.convergence import ConvergenceCriteria, ConvergenceSign
 from ouroboros.evolution.directive_mapping import (
     is_terminal_directive,
     step_action_to_directive,
+    watchdog_timeout_to_directive,
 )
 from ouroboros.evolution.projector import LineageProjector
 from ouroboros.evolution.reflect import ReflectEngine, ReflectOutput
@@ -151,6 +152,16 @@ class StepResult:
     def is_interrupted(self) -> bool:
         """Whether this step was interrupted by graceful shutdown."""
         return self.action == StepAction.INTERRUPTED
+
+
+def _watchdog_timeout_step_action(timeout_kind: str) -> StepAction:
+    """Return the public ``evolve_step`` action matching a watchdog directive."""
+    directive = watchdog_timeout_to_directive(timeout_kind)
+    if directive is None:
+        return StepAction.FAILED
+    if is_terminal_directive(directive):
+        return StepAction.EXHAUSTED
+    return StepAction.STAGNATED
 
 
 class EvolutionaryLoop:
@@ -308,6 +319,39 @@ class EvolutionaryLoop:
             )
         )
 
+    async def _emit_watchdog_timeout_directive(
+        self,
+        exc: GenerationWatchdogTimeout,
+        *,
+        lineage_id: str,
+        generation_number: int,
+        phase: str,
+        action: StepAction | None = None,
+    ) -> None:
+        """Emit ``control.directive.emitted`` for a mapped watchdog timeout."""
+        directive = watchdog_timeout_to_directive(exc.timeout_kind)
+        if directive is None:
+            return
+        await self.event_store.append(
+            create_control_directive_emitted_event(
+                target_type="lineage",
+                target_id=lineage_id,
+                emitted_by="evolver.watchdog",
+                directive=directive,
+                reason=exc.message,
+                execution_id=exc.details.get("execution_id"),
+                lineage_id=lineage_id,
+                generation_number=generation_number,
+                phase=phase,
+                extra={
+                    "timeout_kind": exc.timeout_kind,
+                    "watchdog_details": dict(exc.details),
+                    "is_terminal": is_terminal_directive(directive),
+                    **({"step_action": action.value} if action is not None else {}),
+                },
+            )
+        )
+
     async def _phase_for_failed_step_directive(
         self,
         *,
@@ -419,6 +463,16 @@ class EvolutionaryLoop:
                         "timeout_kind": gen_result.error.timeout_kind,
                         "details": gen_result.error.details,
                     },
+                )
+                await self._emit_watchdog_timeout_directive(
+                    gen_result.error,
+                    lineage_id=lineage.lineage_id,
+                    generation_number=generation_number,
+                    phase=await self._phase_for_failed_step_directive(
+                        lineage_id=lineage.lineage_id,
+                        generation_number=generation_number,
+                    ),
+                    action=_watchdog_timeout_step_action(gen_result.error.timeout_kind),
                 )
                 break
 
@@ -762,22 +816,23 @@ class EvolutionaryLoop:
                 ontology_similarity=0.0,
                 generation=generation_number,
             )
-            await self._emit_step_directive(
-                StepAction.FAILED,
+            watchdog_action = _watchdog_timeout_step_action(gen_result.error.timeout_kind)
+            await self._emit_watchdog_timeout_directive(
+                gen_result.error,
                 lineage_id=lineage.lineage_id,
                 generation_number=generation_number,
                 phase=await self._phase_for_failed_step_directive(
                     lineage_id=lineage.lineage_id,
                     generation_number=generation_number,
                 ),
-                reason=conv_signal.reason,
+                action=watchdog_action,
             )
             return Result.ok(
                 StepResult(
                     generation_result=failed_gen,
                     convergence_signal=conv_signal,
                     lineage=lineage,
-                    action=StepAction.FAILED,
+                    action=watchdog_action,
                     next_generation=generation_number,
                 )
             )
