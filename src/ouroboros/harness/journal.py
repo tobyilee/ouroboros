@@ -33,9 +33,12 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from enum import StrEnum
+from hashlib import sha256
+import json
+from pathlib import PurePosixPath
+import re
 from types import MappingProxyType
 from typing import Annotated, Any
-from uuid import uuid4
 
 from pydantic import (
     AfterValidator,
@@ -51,6 +54,9 @@ from ouroboros.events.base import BaseEvent
 
 JOURNAL_SCHEMA_VERSION = 1
 """Initial schema version for the evidence manifest."""
+
+_MEMORY_FILENAMES = frozenset({"MEMORY.md", ".memory.md"})
+_MEMORY_REFERENCE_RE = re.compile(r"(?<![A-Za-z0-9_.])(?:MEMORY\.md|\.memory\.md)(?![A-Za-z0-9_.])")
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +89,18 @@ def _deep_thaw(value: Any) -> Any:
     """Convert frozen containers back to JSON-native containers for dumps."""
     if isinstance(value, Mapping):
         return {key: _deep_thaw(item) for key, item in value.items()}
-    if isinstance(value, tuple | frozenset):
+    if isinstance(value, tuple):
         return [_deep_thaw(item) for item in value]
+    if isinstance(value, set | frozenset):
+        thawed = [_deep_thaw(item) for item in value]
+        return sorted(thawed, key=_stable_json_sort_key)
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value
+
+
+def _stable_json_sort_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _coerce_to_mapping(value: Any) -> Mapping[str, Any]:
@@ -160,8 +173,42 @@ class EvidenceKind(StrEnum):
     LLM_CALL = "llm_call"
 
 
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid4().hex[:12]}"
+def _stable_entry_handle(
+    *,
+    kind: EvidenceKind,
+    payload: Mapping[str, Any],
+    source_event_ids: tuple[str, ...],
+) -> str:
+    serialized = json.dumps(
+        {
+            "kind": kind.value,
+            "payload": _deep_thaw(payload),
+            "source_event_ids": source_event_ids,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"ev_{sha256(serialized.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _stable_manifest_id(*, ac_id: str, entries: tuple[EvidenceEntry, ...]) -> str:
+    serialized = json.dumps(
+        {
+            "ac_id": ac_id,
+            "entries": [
+                {
+                    "handle": entry.handle,
+                    "kind": entry.kind.value,
+                    "source_event_ids": entry.source_event_ids,
+                }
+                for entry in entries
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return f"manifest_{sha256(serialized.encode('utf-8')).hexdigest()[:16]}"
 
 
 class EvidenceEntry(BaseModel, frozen=True):
@@ -169,7 +216,7 @@ class EvidenceEntry(BaseModel, frozen=True):
 
     Attributes:
         handle: Stable, manifest-scoped identifier that the leaf agent
-            can cite in its evidence claim (``ev_<hex12>`` by default).
+            can cite in its evidence claim (``ev_<sha256-prefix>`` by default).
         kind: Discriminator from :class:`EvidenceKind`.
         ok: Tri-valued success flag. ``True`` = succeeded, ``False`` =
             failed, ``None`` = undetermined (e.g. only the start event
@@ -187,7 +234,7 @@ class EvidenceEntry(BaseModel, frozen=True):
     """
 
     schema_version: int = Field(default=JOURNAL_SCHEMA_VERSION, ge=1)
-    handle: str = Field(default_factory=lambda: _new_id("ev"), min_length=1)
+    handle: str = Field(default="__auto__", min_length=1)
     kind: EvidenceKind
     ok: bool | None = Field(default=None)
     started_at: datetime
@@ -210,6 +257,21 @@ class EvidenceEntry(BaseModel, frozen=True):
             raise ValueError(msg)
         return self
 
+    @model_validator(mode="after")
+    def _stabilize_generated_handle(self) -> EvidenceEntry:
+        if "handle" in self.model_fields_set:
+            return self
+        object.__setattr__(
+            self,
+            "handle",
+            _stable_entry_handle(
+                kind=self.kind,
+                payload=self.payload,
+                source_event_ids=self.source_event_ids,
+            ),
+        )
+        return self
+
 
 class EvidenceManifest(BaseModel, frozen=True):
     """Per-AC evidence manifest derived from the journal.
@@ -220,7 +282,7 @@ class EvidenceManifest(BaseModel, frozen=True):
     its own work.
 
     Attributes:
-        manifest_id: Stable identifier.
+        manifest_id: Stable identifier derived from AC id and entries.
         ac_id: Acceptance-criterion identifier this manifest covers.
         entries: Tuple of :class:`EvidenceEntry` records in observation
             order.
@@ -229,7 +291,7 @@ class EvidenceManifest(BaseModel, frozen=True):
     """
 
     schema_version: int = Field(default=JOURNAL_SCHEMA_VERSION, ge=1)
-    manifest_id: str = Field(default_factory=lambda: _new_id("manifest"), min_length=1)
+    manifest_id: str = Field(default="__auto__", min_length=1)
     ac_id: str = Field(..., min_length=1)
     entries: tuple[EvidenceEntry, ...] = Field(default_factory=tuple)
     normalized_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -243,6 +305,17 @@ class EvidenceManifest(BaseModel, frozen=True):
             msg = "EvidenceManifest.ac_id must be a non-blank identifier"
             raise ValueError(msg)
         return stripped
+
+    @model_validator(mode="after")
+    def _stabilize_generated_manifest_id(self) -> EvidenceManifest:
+        if "manifest_id" in self.model_fields_set:
+            return self
+        object.__setattr__(
+            self,
+            "manifest_id",
+            _stable_manifest_id(ac_id=self.ac_id, entries=self.entries),
+        )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +453,10 @@ def normalize_events(
     slots: list[BaseEvent | EvidenceEntry | None] = []
     tool_slot_index: dict[str, int] = {}
     llm_slot_index: dict[str, int] = {}
+    memory_tool_call_ids: set[str] = set()
+    memory_llm_call_ids: set[str] = set()
+    orphan_tool_slot_index: dict[str, int] = {}
+    orphan_llm_slot_index: dict[str, int] = {}
 
     for event in events:
         # Skip events that carry explicit scope tokens but none of them
@@ -389,16 +466,40 @@ def normalize_events(
         if scope_tokens and normalized_ac_id not in scope_tokens:
             continue
 
+        if _is_memory_derived_event(event):
+            call_id = _slot_call_id(event)
+            if call_id:
+                if event.type in {_TOOL_STARTED, _TOOL_RETURNED}:
+                    memory_tool_call_ids.add(call_id)
+                    slot = tool_slot_index.pop(call_id, None)
+                    if slot is not None:
+                        slots[slot] = None
+                    orphan_slot = orphan_tool_slot_index.pop(call_id, None)
+                    if orphan_slot is not None:
+                        slots[orphan_slot] = None
+                elif event.type in {_LLM_REQUESTED, _LLM_RETURNED}:
+                    memory_llm_call_ids.add(call_id)
+                    slot = llm_slot_index.pop(call_id, None)
+                    if slot is not None:
+                        slots[slot] = None
+                    orphan_slot = orphan_llm_slot_index.pop(call_id, None)
+                    if orphan_slot is not None:
+                        slots[orphan_slot] = None
+            continue
+
         if event.type == _TOOL_STARTED:
             call_id = event.data.get("call_id") if isinstance(event.data, dict) else None
-            if isinstance(call_id, str) and call_id.strip():
-                tool_slot_index[call_id.strip()] = len(slots)
+            normalized_call_id = call_id.strip() if isinstance(call_id, str) else ""
+            if normalized_call_id and normalized_call_id not in memory_tool_call_ids:
+                tool_slot_index[normalized_call_id] = len(slots)
                 slots.append(event)
             continue
 
         if event.type == _TOOL_RETURNED:
             call_id_raw = event.data.get("call_id") if isinstance(event.data, dict) else None
             call_id = call_id_raw.strip() if isinstance(call_id_raw, str) else ""
+            if call_id in memory_tool_call_ids:
+                continue
             slot = tool_slot_index.pop(call_id, None) if call_id else None
             start_event: BaseEvent | None = None
             if slot is not None:
@@ -409,19 +510,24 @@ def normalize_events(
             if slot is not None:
                 slots[slot] = entry
             else:
+                if call_id:
+                    orphan_tool_slot_index[call_id] = len(slots)
                 slots.append(entry)
             continue
 
         if event.type == _LLM_REQUESTED:
             call_id = event.data.get("call_id") if isinstance(event.data, dict) else None
-            if isinstance(call_id, str) and call_id.strip():
-                llm_slot_index[call_id.strip()] = len(slots)
+            normalized_call_id = call_id.strip() if isinstance(call_id, str) else ""
+            if normalized_call_id and normalized_call_id not in memory_llm_call_ids:
+                llm_slot_index[normalized_call_id] = len(slots)
                 slots.append(event)
             continue
 
         if event.type == _LLM_RETURNED:
             call_id_raw = event.data.get("call_id") if isinstance(event.data, dict) else None
             call_id = call_id_raw.strip() if isinstance(call_id_raw, str) else ""
+            if call_id in memory_llm_call_ids:
+                continue
             slot = llm_slot_index.pop(call_id, None) if call_id else None
             requested_event: BaseEvent | None = None
             if slot is not None:
@@ -432,6 +538,8 @@ def normalize_events(
             if slot is not None:
                 slots[slot] = entry
             else:
+                if call_id:
+                    orphan_llm_slot_index[call_id] = len(slots)
                 slots.append(entry)
             continue
 
@@ -481,6 +589,115 @@ def _event_child_ac_id(*events: BaseEvent | None) -> str | None:
             if isinstance(value, str) and value.strip():
                 return value.strip()
     return None
+
+
+def _is_memory_derived_event(event: BaseEvent) -> bool:
+    if _looks_like_memory_reference(event.aggregate_id) or _looks_like_memory_reference(
+        event.aggregate_type
+    ):
+        return True
+    if not isinstance(event.data, Mapping):
+        return False
+
+    extra = event.data.get("extra")
+    if _is_memory_provenance_mapping(extra):
+        return True
+
+    if event.type == _TOOL_STARTED:
+        return _is_memory_derived_tool_start(event.data)
+    if event.type == _LLM_REQUESTED:
+        return _is_memory_derived_llm_request(event.data)
+    if event.type in {_TOOL_RETURNED, _LLM_RETURNED}:
+        return _is_memory_derived_return(event.data)
+    return _has_memory_provenance_marker(event.data)
+
+
+def _is_memory_derived_tool_start(data: Mapping[str, Any]) -> bool:
+    caller = data.get("caller")
+    if _has_memory_provenance_marker(caller):
+        return True
+
+    tool_name = data.get("tool_name")
+    args_preview = data.get("args_preview")
+    if not isinstance(args_preview, str):
+        return False
+
+    if isinstance(tool_name, str) and tool_name.strip() == "Read":
+        return _looks_like_memory_reference(args_preview)
+    return _looks_like_memory_command(args_preview)
+
+
+def _is_memory_derived_llm_request(data: Mapping[str, Any]) -> bool:
+    return _has_memory_provenance_marker(data.get("caller")) or _has_memory_provenance_marker(
+        data.get("prompt_preview")
+    )
+
+
+def _is_memory_derived_return(data: Mapping[str, Any]) -> bool:
+    if _is_memory_provenance_mapping(data):
+        return True
+    return any(
+        _has_memory_provenance_marker(data.get(key))
+        for key in ("caller", "args_preview", "prompt_preview")
+    )
+
+
+def _is_memory_provenance_mapping(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    provenance_keys = {
+        "derived_from",
+        "memory_source",
+        "memory_path",
+        "source_path",
+        "source_file",
+        "provenance",
+        "origin",
+    }
+    for key, item in value.items():
+        normalized_key = str(key).strip().lower()
+        if normalized_key in provenance_keys and _looks_like_memory_reference(item):
+            return True
+        if normalized_key in {"memory_derived", "from_memory"} and item is True:
+            return True
+    return False
+
+
+def _has_memory_provenance_marker(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    lowered = value.lower()
+    return "memory.md-derived" in lowered or ".memory.md-derived" in lowered
+
+
+def _looks_like_memory_command(value: str) -> bool:
+    stripped = value.strip()
+    lowered = stripped.lower()
+    if not any(name.lower() in lowered for name in _MEMORY_FILENAMES):
+        return False
+    return bool(
+        re.search(
+            r"(?:^|[;&|()\s])(?:cat|less|more|head|tail|sed|awk|python|python3|node|ruby|perl)\s+[^;&|]*\.?memory\.md(?:$|[\s;&|)])",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _looks_like_memory_reference(value: Any) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    if _MEMORY_REFERENCE_RE.search(value):
+        return True
+    normalized = value.replace("\\", "/")
+    for part in normalized.split():
+        token = part.strip("`'\".,:;()[]{}")
+        candidates = (token, token.rsplit("=", maxsplit=1)[-1], token.rsplit(":", maxsplit=1)[-1])
+        for candidate in candidates:
+            filename = PurePosixPath(candidate.strip("`'\".,:;()[]{}")).name
+            if filename in _MEMORY_FILENAMES:
+                return True
+    return False
 
 
 def _build_tool_entry_for_returned(
