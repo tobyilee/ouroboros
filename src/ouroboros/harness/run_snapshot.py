@@ -11,6 +11,7 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from types import MappingProxyType
 
+from ouroboros.core.hitl_state import HumanInputSnapshot, HumanInputState
 from ouroboros.harness.projection import (
     ArtifactRecord,
     RunRecord,
@@ -30,6 +31,7 @@ def build_run_snapshot(
     steps: Iterable[StepRecord] = (),
     artifacts: Iterable[ArtifactRecord] = (),
     verdict: VerdictRecord | None = None,
+    pending_human_inputs: Iterable[HumanInputSnapshot] = (),
     recorded_at: datetime | None = None,
 ) -> RunSnapshotRecord:
     """Build a safe-resume snapshot from projection records.
@@ -43,6 +45,10 @@ def build_run_snapshot(
     stage_tuple = tuple(stages)
     step_tuple = tuple(steps)
     artifact_tuple = tuple(artifacts)
+    pending_human_input_tuple = _pending_human_inputs_for_run(
+        pending_human_inputs,
+        run_id=run.run_id,
+    )
     _validate_projection_bundle(
         run=run,
         stages=stage_tuple,
@@ -79,7 +85,11 @@ def build_run_snapshot(
 
     missing_linked_verdict = run.verdict_id is not None and verdict is None
     unlinked_supplied_verdict = verdict is not None and run.verdict_id is None
-    derived_source_event_ids = _snapshot_source_event_ids(steps=step_tuple, verdict=verdict)
+    derived_source_event_ids = _snapshot_source_event_ids(
+        steps=step_tuple,
+        verdict=verdict,
+        pending_human_inputs=pending_human_input_tuple,
+    )
     status = _derive_status(
         run=run,
         verdict=verdict,
@@ -89,6 +99,9 @@ def build_run_snapshot(
         pending_failed_step_ids=pending_failed_step_ids,
         pending_success_step_ids=pending_success_step_ids,
         pending_step_ids=pending_step_ids,
+        pending_human_input_request_ids=tuple(
+            request.request_id for request in pending_human_input_tuple
+        ),
         failed_step_ids=failed_step_ids,
         unknown_step_ids=unknown_step_ids,
     )
@@ -111,6 +124,13 @@ def build_run_snapshot(
         "step_count": len(step_tuple),
         "artifact_count": len(artifact_tuple),
     }
+    if pending_human_input_tuple:
+        metadata["pending_human_input_request_ids"] = tuple(
+            request.request_id for request in pending_human_input_tuple
+        )
+        metadata["pending_human_input_resume_targets"] = tuple(
+            request.resume_target for request in pending_human_input_tuple
+        )
     return RunSnapshotRecord(
         run_id=run.run_id,
         status=status,
@@ -130,6 +150,16 @@ def build_run_snapshot(
         source_event_ids=derived_source_event_ids,
         recorded_at=recorded_at or datetime.now(UTC),
         metadata=MappingProxyType(metadata),
+    )
+
+
+def _pending_human_inputs_for_run(
+    pending_human_inputs: Iterable[HumanInputSnapshot], *, run_id: str
+) -> tuple[HumanInputSnapshot, ...]:
+    return tuple(
+        request
+        for request in pending_human_inputs
+        if request.state is HumanInputState.PENDING and request.run_id == run_id
     )
 
 
@@ -226,13 +256,17 @@ def _validate_projection_bundle(
 
 
 def _snapshot_source_event_ids(
-    *, steps: tuple[StepRecord, ...], verdict: VerdictRecord | None
+    *,
+    steps: tuple[StepRecord, ...],
+    verdict: VerdictRecord | None,
+    pending_human_inputs: tuple[HumanInputSnapshot, ...] = (),
 ) -> tuple[str, ...]:
     ordered_ids: list[str] = []
     seen: set[str] = set()
     for event_id in (
         *(event_id for step in steps for event_id in step.source_event_ids),
         *((verdict.evidence_event_ids) if verdict is not None else ()),
+        *(request.request_event_id for request in pending_human_inputs),
     ):
         if event_id not in seen:
             ordered_ids.append(event_id)
@@ -260,6 +294,7 @@ def _derive_status(
     pending_failed_step_ids: tuple[str, ...],
     pending_success_step_ids: tuple[str, ...],
     pending_step_ids: tuple[str, ...],
+    pending_human_input_request_ids: tuple[str, ...],
     failed_step_ids: tuple[str, ...],
     unknown_step_ids: tuple[str, ...],
 ) -> RunSnapshotStatus:
@@ -290,10 +325,12 @@ def _derive_status(
         return RunSnapshotStatus.FAILED
     if run.ended_at is not None:
         return RunSnapshotStatus.UNKNOWN
-    if pending_step_ids:
-        return RunSnapshotStatus.RUNNING
     if unknown_step_ids:
         return RunSnapshotStatus.UNKNOWN
+    if pending_human_input_request_ids:
+        return RunSnapshotStatus.WAITING
+    if pending_step_ids:
+        return RunSnapshotStatus.RUNNING
     return RunSnapshotStatus.UNKNOWN
 
 
