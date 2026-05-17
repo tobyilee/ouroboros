@@ -29,6 +29,7 @@ from ouroboros.orchestrator.parallel_executor import (
     StageExecutionOutcome,
     _build_governed_parent_summary,
     _message_contains_test_success,
+    _runtime_messages_support_command_claim,
     render_parallel_completion_message,
     render_parallel_verification_report,
 )
@@ -219,6 +220,93 @@ class _FinalMessageRuntime:
                 metadata=dict(resume_handle.metadata) if resume_handle is not None else {},
             ),
         )
+
+
+def test_command_claim_supports_exact_structured_shell_body() -> None:
+    """Regression for #978 broader observation: read-only command claims may be shell-wrapped."""
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={
+            "tool_input": {"command": "/bin/zsh -lc \"rg --files -g 'AGENTS.md' -g '!**/.git/**'\""}
+        },
+    )
+
+    assert _runtime_messages_support_command_claim(
+        "rg --files -g 'AGENTS.md' -g '!**/.git/**'",
+        (message,),
+    )
+
+
+def test_command_claim_does_not_support_partial_shell_body() -> None:
+    """Generic commands_run aliases stay exact; partial shell scripts are not proof."""
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={"tool_input": {"command": "/bin/zsh -lc 'pwd && rg --files'"}},
+    )
+
+    assert not _runtime_messages_support_command_claim("rg --files", (message,))
+
+
+def test_command_claim_supports_goose_cmd_and_list_shapes() -> None:
+    """Goose Bash tool_input may use cmd and list argv forms instead of command."""
+    cmd_message = AgentMessage(
+        type="tool",
+        content="Calling tool: Bash: pytest tests/test_a.py",
+        tool_name="Bash",
+        data={"tool_input": {"cmd": "pytest tests/test_a.py"}},
+    )
+    list_message = AgentMessage(
+        type="tool",
+        content="Calling tool: Bash: python -m unittest test_slugify.py",
+        tool_name="Bash",
+        data={"tool_input": {"cmd": ["python", "-m", "unittest", "test_slugify.py"]}},
+    )
+
+    assert _runtime_messages_support_command_claim("pytest tests/test_a.py", (cmd_message,))
+    assert _runtime_messages_support_command_claim(
+        "python -m unittest test_slugify.py",
+        (list_message,),
+    )
+
+
+def test_command_claim_supports_inner_command_after_safe_shell_preamble() -> None:
+    """Wrapped production commands may cite the inner command after setup preambles."""
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={
+            "tool_input": {"command": "/bin/bash -lc 'cd /workspace && python scripts/generate.py'"}
+        },
+    )
+
+    assert _runtime_messages_support_command_claim(
+        "python scripts/generate.py",
+        (message,),
+    )
+
+
+def test_command_claim_rejects_inner_command_after_non_setup_preamble() -> None:
+    """Non-test aliases must not treat arbitrary shell-script tails as proof."""
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={
+            "tool_input": {
+                "command": "/bin/zsh -lc 'python setup.py && python scripts/generate.py'"
+            }
+        },
+    )
+
+    assert not _runtime_messages_support_command_claim(
+        "python scripts/generate.py",
+        (message,),
+    )
 
 
 class TestProfileAwareDecompositionAudit:
@@ -1375,6 +1463,8 @@ class TestParallelACExecutor:
         assert "Do not implement, test, document, or pre-create work" in runtime.last_prompt
         assert "sibling or future ACs" in runtime.last_prompt
         assert "current AC in this runtime session" in runtime.last_prompt
+        assert "omit exploratory" in runtime.last_prompt
+        assert "rg, grep, sed, cat, ls, find, or pwd" in runtime.last_prompt
         assert "explicitly state: [TASK_COMPLETE]" not in runtime.last_prompt
 
     @pytest.mark.asyncio
@@ -1443,6 +1533,7 @@ class TestParallelACExecutor:
         assert result.error is None
         assert runtime.last_prompt is not None
         assert "documentation-only current AC" in runtime.last_prompt
+        assert "read/grep/diff command when that command is the validation" in runtime.last_prompt
         assert "files_touched, commands_run" in runtime.last_prompt
         assert "files_touched, commands_run, tests_passed" not in runtime.last_prompt
         assert result.typed_evidence is not None
@@ -1528,6 +1619,7 @@ class TestParallelACExecutor:
         assert result.success is True
         assert runtime.last_prompt is not None
         assert "documentation-only current AC" in runtime.last_prompt
+        assert "read/grep/diff command when that command is the validation" in runtime.last_prompt
         assert "files_touched, commands_run" in runtime.last_prompt
         assert "files_touched, commands_run, tests_passed" not in runtime.last_prompt
         evidence_event = next(

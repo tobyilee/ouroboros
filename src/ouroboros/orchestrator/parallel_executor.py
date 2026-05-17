@@ -338,6 +338,36 @@ def _runtime_message_file_path_values(message: AgentMessage) -> tuple[str, ...]:
     return tuple(values)
 
 
+def _runtime_message_command_values(message: AgentMessage) -> tuple[str, ...]:
+    """Return explicit command strings carried by a runtime message.
+
+    Runtime adapters normalize shell calls slightly differently.  Codex-like
+    events usually expose ``tool_input.command``; Goose may expose ``cmd`` or a
+    list argv form.  Keep extraction structured, not prose-based, so command
+    evidence does not fall back to arbitrary assistant text.
+    """
+    values: list[str] = []
+    for container_key in ("tool_input", "input", "arguments", "args"):
+        container = message.data.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for command_key in ("command", "cmd", "command_line"):
+            command = container.get(command_key)
+            normalized = _runtime_command_value_to_text(command)
+            if normalized and normalized not in values:
+                values.append(normalized)
+    return tuple(values)
+
+
+def _runtime_command_value_to_text(value: object) -> str | None:
+    """Normalize a structured runtime command value into shell text."""
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list) and value:
+        return shlex.join(str(part) for part in value)
+    return None
+
+
 def _file_claim_matches_runtime_path(
     claim: str,
     runtime_path: str,
@@ -404,19 +434,30 @@ def _runtime_message_supports_command_claim(value: str, message: AgentMessage) -
     equivalent only through the structured Bash command field; arbitrary output
     text or assistant narration must not create command aliases.
     """
-    if _runtime_messages_support_claim(value, (message,)):
-        return True
     if message.tool_name != "Bash":
-        return False
-    tool_input = message.data.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return False
-    runtime_command = tool_input.get("command")
-    if not isinstance(runtime_command, str):
-        return False
+        return _runtime_messages_support_claim(value, (message,))
     claim_aliases = set(_normalized_command_claim_aliases(value))
-    runtime_aliases = set(_normalized_command_claim_aliases(runtime_command))
-    return bool(claim_aliases and runtime_aliases and claim_aliases.intersection(runtime_aliases))
+    claim_test_invocation = _test_command_invocation(value)
+    for runtime_command in _runtime_message_command_values(message):
+        runtime_aliases = set(_normalized_command_claim_aliases(runtime_command))
+        if claim_aliases and runtime_aliases and claim_aliases.intersection(runtime_aliases):
+            return True
+
+        runtime_inner_command = _single_command_after_safe_shell_preamble(runtime_command)
+        if runtime_inner_command and runtime_inner_command in claim_aliases:
+            return True
+
+        runtime_test_invocation = _test_command_invocation(runtime_command)
+        if (
+            claim_test_invocation
+            and runtime_test_invocation
+            and (
+                runtime_test_invocation == claim_test_invocation
+                or runtime_test_invocation.startswith(claim_test_invocation + " ")
+            )
+        ):
+            return True
+    return False
 
 
 def _runtime_messages_support_command_claim(
@@ -683,17 +724,42 @@ def _shell_command_body(command: str) -> str | None:
 
 def _test_invocation_from_shell_body(body: str) -> str | None:
     """Return a test invocation after conservative shell setup preambles."""
+    for segment in _segments_after_safe_shell_preamble(body):
+        invocation = _test_invocation_from_prefix(segment)
+        if invocation is not None:
+            return invocation
+        return None
+    return None
+
+
+def _single_command_after_safe_shell_preamble(command: str) -> str | None:
+    """Return a wrapped inner command after only safe setup preambles.
+
+    Generic ``commands_run`` evidence may cite the useful command inside a
+    runtime-recorded shell wrapper such as ``cd /work && python scripts/gen.py``.
+    Keep this narrower than substring containment: only ignore setup-only
+    preambles and only when exactly one non-preamble command remains.
+    """
+    body = _shell_command_body(command)
+    if body is None:
+        return None
+    segments = tuple(_segments_after_safe_shell_preamble(body))
+    if len(segments) != 1:
+        return None
+    return _normalized_evidence_text(segments[0])
+
+
+def _segments_after_safe_shell_preamble(body: str) -> tuple[str, ...]:
+    """Return non-preamble shell segments after setup-only commands."""
+    remaining: list[str] = []
     for segment in re.split(r"\s*&&\s*", body.strip()):
         normalized_segment = segment.strip()
         if not normalized_segment:
             continue
-        invocation = _test_invocation_from_prefix(normalized_segment)
-        if invocation is not None:
-            return invocation
-        if _is_safe_test_command_preamble(normalized_segment):
+        if not remaining and _is_safe_test_command_preamble(normalized_segment):
             continue
-        return None
-    return None
+        remaining.append(normalized_segment)
+    return tuple(remaining)
 
 
 def _is_safe_test_command_preamble(segment: str) -> bool:
@@ -772,9 +838,21 @@ def _looks_like_unittest_command(command: str) -> bool:
 
 
 def _normalized_command_claim_aliases(command: str) -> tuple[str, ...]:
-    """Return normalized command forms that a concise evidence claim may use."""
+    """Return normalized command forms that a concise evidence claim may use.
+
+    Structured Bash tool inputs may wrap the user command as
+    ``/bin/zsh -lc '<body>'``.  The wrapper itself is runtime-backed, so an
+    evidence claim may cite the exact shell body without re-stating the wrapper.
+    Keep this alias exact: test-command-specific helpers handle conservative
+    setup preambles, while generic ``commands_run`` claims should not be proven
+    by partial substrings of arbitrary shell scripts.
+    """
     normalized = _normalized_evidence_text(command)
     aliases = [normalized] if normalized else []
+    shell_body = _shell_command_body(command)
+    normalized_shell_body = _normalized_evidence_text(shell_body) if shell_body else None
+    if normalized_shell_body and normalized_shell_body not in aliases:
+        aliases.append(normalized_shell_body)
     test_invocation = _test_command_invocation(command)
     if test_invocation and test_invocation not in aliases:
         aliases.append(test_invocation)
@@ -4179,7 +4257,8 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
             if _is_documentation_only_ac(ac_content):
                 doc_only_note = (
                     "This is a documentation-only current AC: verify the requested docs "
-                    "with current-session README/docs evidence such as Edit plus grep/read/diff. "
+                    "with current-session README/docs evidence such as Edit plus a direct "
+                    "read/grep/diff command when that command is the validation for the docs change. "
                     "Do not include tests_passed unless this current AC explicitly required "
                     "code tests and you ran those tests in this runtime session.\n"
                 )
@@ -4191,7 +4270,11 @@ Respond with either "ATOMIC" or the JSON array only, nothing else.
                 "related files, future functions, tests, or docs, treat that work as "
                 "out of scope unless the current AC explicitly requires it.\n"
                 "Your final evidence JSON must cite only files, commands, and tests "
-                "directly changed or run for this current AC in this runtime session.\n"
+                "directly changed or run for this current AC in this runtime session. "
+                "For commands_run, include only validation/production commands such "
+                "as test, build, lint, generation, or docs verification commands; omit "
+                "exploratory discovery commands such as rg, grep, sed, cat, ls, find, "
+                "or pwd unless the current AC explicitly requires that command as validation.\n"
                 f"{doc_only_note}\n"
                 "Use the available tools to accomplish this task. Report progress through "
                 "tool-visible work, not a prose-only completion claim.\n"
