@@ -1099,6 +1099,124 @@ def test_command_claim_rejects_inner_command_after_non_setup_preamble() -> None:
     )
 
 
+def test_command_claim_supports_command_with_output_redirection_and_pager_pipe() -> None:
+    """A clean ``commands_run`` claim matches a run wrapped in ``2>&1 | tail``.
+
+    Regression: agents routinely run ``<cmd> 2>&1 | tail -20`` while citing the
+    clean ``<cmd>`` in evidence. The trailing redirection and output-only pager
+    pipe must not block the match (which previously failed the whole AC as
+    FABRICATION_SUSPECTED).
+    """
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={
+            "tool_input": {
+                "command": (
+                    "python -m ruff check src/poc/structure_extractor.py "
+                    "tests/test_structure_and_draft_substance.py 2>&1 | tail -20"
+                )
+            }
+        },
+    )
+
+    assert _runtime_messages_support_command_claim(
+        "python -m ruff check src/poc/structure_extractor.py "
+        "tests/test_structure_and_draft_substance.py",
+        (message,),
+    )
+
+
+def test_command_claim_keeps_meaningful_pipeline_segments() -> None:
+    """Only output-filter pipes are stripped; real pipelines are not over-matched."""
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={"tool_input": {"command": "python gen.py | python process.py"}},
+    )
+
+    # ``process.py`` is not an output filter, so the pipe stays and the partial
+    # ``python gen.py`` claim is not proven by this runtime command.
+    assert not _runtime_messages_support_command_claim("python gen.py", (message,))
+
+
+def test_command_claim_rejects_grep_filtered_run_as_clean_command() -> None:
+    """A ``... | grep <token>`` run must not back a clean ``commands_run`` claim.
+
+    ``grep`` can hide failure output and rewrite the evidence stream the
+    verifier sees, so treating it as removable presentation plumbing would
+    weaken the anti-fabrication boundary: a filtered ``pytest tests/foo.py |
+    grep passed`` run could "prove" the clean ``pytest tests/foo.py`` claim
+    even when the unfiltered run had failures.
+    """
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={"tool_input": {"command": "pytest tests/unit/test_foo.py | grep passed"}},
+    )
+
+    assert not _runtime_messages_support_command_claim("pytest tests/unit/test_foo.py", (message,))
+
+
+def test_command_claim_rejects_grep_filtered_run_as_tests_passed_claim() -> None:
+    """A grep-filtered test run must not back a ``tests_passed`` claim either.
+
+    ``_normalized_command_claim_aliases`` is also consumed on the
+    ``tests_passed`` path, so the same anti-fabrication invariant has to hold
+    there: a grep-filtered run is not equivalent to the unfiltered test
+    command for evidence-matching purposes.
+    """
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={"tool_input": {"command": "pytest tests/unit/test_foo.py -x | grep PASSED"}},
+    )
+
+    assert not _runtime_messages_support_command_claim(
+        "pytest tests/unit/test_foo.py -x", (message,)
+    )
+
+
+def test_command_claim_rejects_wc_collapsed_run_as_clean_command() -> None:
+    """``... | wc -l`` collapses the evidence stream to a count and must not match.
+
+    ``wc`` discards every line of the underlying output, so a verifier looking
+    at the runtime transcript would no longer see the unfiltered command's
+    output. Treating ``wc`` as removable plumbing would let a filtered run
+    silently back a clean ``commands_run`` claim.
+    """
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={"tool_input": {"command": "pytest tests/unit/test_foo.py | wc -l"}},
+    )
+
+    assert not _runtime_messages_support_command_claim("pytest tests/unit/test_foo.py", (message,))
+
+
+def test_command_claim_rejects_tee_redirected_run_as_clean_command() -> None:
+    """``... | tee out.log`` diverts the evidence stream and must not back a claim.
+
+    ``tee`` is a side-effecting redirector, not presentation-only output
+    filtering — the file write means the unfiltered runtime stream is no
+    longer the only observable evidence. Keep alias matching strict so the
+    filtered command does not prove a clean ``commands_run`` claim.
+    """
+    message = AgentMessage(
+        type="tool",
+        content="Bash command started",
+        tool_name="Bash",
+        data={"tool_input": {"command": "pytest tests/unit/test_foo.py | tee pytest.log"}},
+    )
+
+    assert not _runtime_messages_support_command_claim("pytest tests/unit/test_foo.py", (message,))
+
+
 class TestProfileAwareDecompositionAudit:
     @pytest.mark.asyncio
     async def test_level_started_event_records_active_decomposition_profile(self) -> None:
