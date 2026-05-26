@@ -102,19 +102,88 @@ def _validate_fresh_execution_mode(
         return Result.err(
             MCPToolError(
                 "seed.orchestrator.execution_mode='legacy' was removed after #978 P5; "
-                "typed evidence plus verifier PASS is now required for acceptance.",
+                "omit the selector for the default runner or set execution_mode='fat_harness' "
+                "to opt in to typed evidence plus verifier PASS acceptance.",
                 tool_name=tool_name,
             )
         )
     if execution_mode not in (None, "", "fat_harness"):
         return Result.err(
             MCPToolError(
-                "seed.orchestrator.execution_mode is no longer configurable after "
-                f"the fat-harness default flip (got {execution_mode!r}).",
+                "seed.orchestrator.execution_mode must be 'fat_harness' when set "
+                f"(got {execution_mode!r}).",
                 tool_name=tool_name,
             )
         )
     return Result.ok(None)
+
+
+def _validate_plugin_execution_mode(
+    execution_mode: Any,
+    *,
+    tool_name: str,
+) -> Result[None, MCPToolError]:
+    """Reject acceptance modes plugin dispatch cannot enforce."""
+    if execution_mode == "fat_harness":
+        return Result.err(
+            MCPToolError(
+                "seed.orchestrator.execution_mode='fat_harness' is not supported in "
+                "OpenCode plugin dispatch because the child task cannot enforce typed "
+                "evidence plus verifier PASS acceptance. Run without plugin dispatch or "
+                "omit the selector for the default runner.",
+                tool_name=tool_name,
+            )
+        )
+    return Result.ok(None)
+
+
+async def _validate_plugin_resume_acceptance_contract(
+    *,
+    event_store: EventStore | None,
+    execution_mode: Any,
+    session_id: str | None,
+    tool_name: str,
+) -> Result[None, MCPToolError]:
+    """Reject plugin resumes whose persisted contract requires fat-harness."""
+    if not session_id:
+        return Result.ok(None)
+
+    store = event_store or EventStore()
+    owns_store = event_store is None
+    try:
+        await store.initialize()
+        tracker_result = await SessionRepository(store).reconstruct_session(session_id)
+        if tracker_result.is_err:
+            return Result.err(
+                MCPToolError(
+                    f"Session resume failed: {tracker_result.error.message}",
+                    tool_name=tool_name,
+                )
+            )
+        persisted_fat_harness_mode = tracker_result.value.progress.get("fat_harness_mode")
+        if persisted_fat_harness_mode is True:
+            return Result.err(
+                MCPToolError(
+                    "OpenCode plugin dispatch cannot resume sessions created with "
+                    "fat_harness_mode=True because the child task cannot enforce typed "
+                    "evidence plus verifier PASS acceptance. Resume without plugin dispatch.",
+                    tool_name=tool_name,
+                )
+            )
+        if execution_mode == "fat_harness" and not isinstance(persisted_fat_harness_mode, bool):
+            return Result.err(
+                MCPToolError(
+                    "OpenCode plugin dispatch cannot resume sessions whose seed requests "
+                    "execution_mode='fat_harness' without a persisted fat_harness_mode "
+                    "contract because the child task cannot enforce typed evidence plus "
+                    "verifier PASS acceptance. Resume without plugin dispatch.",
+                    tool_name=tool_name,
+                )
+            )
+        return Result.ok(None)
+    finally:
+        if owns_store:
+            await store.close()
 
 
 def _pause_metadata_from_progress(progress: dict[str, Any]) -> dict[str, Any]:
@@ -350,18 +419,32 @@ class ExecuteSeedHandler(BridgeAwareMixin):
             if mode_result.is_err:
                 return mode_result
 
-        # --- Subagent dispatch: gate on runtime + opencode_mode ---
-        payload = build_execute_subagent(
-            seed_content=seed_content,
-            session_id=session_id,
-            seed_path=arguments.get("seed_path"),
-            cwd=str(resolved_cwd),
-            max_iterations=max_iterations,
-            skip_qa=arguments.get("skip_qa", False),
-            model_tier=model_tier,
-            max_parallel_workers=max_parallel_workers,
-        )
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
+            if is_resume:
+                plugin_mode_result = await _validate_plugin_resume_acceptance_contract(
+                    event_store=self.event_store,
+                    execution_mode=execution_mode,
+                    session_id=session_id,
+                    tool_name="ouroboros_execute_seed",
+                )
+            else:
+                plugin_mode_result = _validate_plugin_execution_mode(
+                    execution_mode,
+                    tool_name="ouroboros_execute_seed",
+                )
+            if plugin_mode_result.is_err:
+                return plugin_mode_result
+            # --- Subagent dispatch: gate on runtime + opencode_mode ---
+            payload = build_execute_subagent(
+                seed_content=seed_content,
+                session_id=session_id,
+                seed_path=arguments.get("seed_path"),
+                cwd=str(resolved_cwd),
+                max_iterations=max_iterations,
+                skip_qa=arguments.get("skip_qa", False),
+                model_tier=model_tier,
+                max_parallel_workers=max_parallel_workers,
+            )
             await emit_subagent_dispatched_event(
                 self.event_store,
                 session_id=session_id,
@@ -498,13 +581,13 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                 # Create checkpoint store for execution state persistence
                 checkpoint_store = CheckpointStore()
                 checkpoint_store.initialize()
-                fat_harness_mode = True
+                fat_harness_mode = execution_mode == "fat_harness"
                 if is_resume:
                     persisted_fat_harness_mode = tracker.progress.get("fat_harness_mode")
                     if isinstance(persisted_fat_harness_mode, bool):
                         fat_harness_mode = persisted_fat_harness_mode
                     else:
-                        fat_harness_mode = execution_mode != "legacy"
+                        fat_harness_mode = execution_mode == "fat_harness"
 
                 # Create orchestrator runner
                 runner = OrchestratorRunner(
@@ -1138,6 +1221,21 @@ class StartExecuteSeedHandler:
         # --- Subagent dispatch: gate on runtime + opencode_mode ---
         # StartExecuteSeedHandler delegates to ExecuteSeedHandler internally.
         if should_dispatch_via_plugin(self.agent_runtime_backend, self.opencode_mode):
+            if is_resume:
+                plugin_mode_result = await _validate_plugin_resume_acceptance_contract(
+                    event_store=self.event_store,
+                    execution_mode=execution_mode,
+                    session_id=arguments.get("session_id"),
+                    tool_name="ouroboros_start_execute_seed",
+                )
+            else:
+                plugin_mode_result = _validate_plugin_execution_mode(
+                    execution_mode,
+                    tool_name="ouroboros_start_execute_seed",
+                )
+            if plugin_mode_result.is_err:
+                return plugin_mode_result
+
             # Initialize event store first so the audit event persists.
             await self._event_store.initialize()
 
