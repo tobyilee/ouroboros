@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from ouroboros.core.seed import Seed
 
 _AUTO_WRAPPER_CRITERIA = frozenset(
@@ -59,7 +61,7 @@ _OBSERVATION_CONTEXT_ALTERNATES = (
 
 _CANONICAL_HELLO_AUTO_OBSERVATION_AC = (
     "Create `hello_auto.py` and `tests/test_hello_auto.py` so "
-    "`hello_auto() -> str` returns exactly `hello from ooo auto`, "
+    "`hello_auto() -> str` returns exactly `{return_value}`, "
     "the test imports `hello_auto` and asserts that exact value, and "
     "the exact command `uv run pytest tests/test_hello_auto.py` passes."
 )
@@ -122,10 +124,11 @@ def normalize_execution_acceptance(seed: Seed) -> Seed:
     context.
     """
     criteria = tuple(ac for ac in seed.acceptance_criteria if ac and ac.strip())
+    direction_context = "\n".join((seed.goal, *seed.constraints))
     if not criteria or not _has_auto_wrapper_context(seed.goal, criteria):
         return seed
 
-    filtered = normalize_observation_execution_criteria(criteria, context_text=seed.goal)
+    filtered = normalize_observation_execution_criteria(criteria, context_text=direction_context)
     if not filtered or filtered == criteria:
         return seed
     return seed.model_copy(update={"acceptance_criteria": filtered})
@@ -162,7 +165,8 @@ def normalize_observation_execution_criteria(
         passthrough = [
             line for line in execution_lines if not _is_hello_auto_observation_unit_line(line)
         ]
-        return tuple(dict.fromkeys((_CANONICAL_HELLO_AUTO_OBSERVATION_AC, *passthrough)))
+        canonical = _canonical_hello_auto_observation_ac(context_text, tuple(execution_lines))
+        return tuple(dict.fromkeys((canonical, *passthrough)))
 
     normalized = [_normalize_known_observation_execution_line(line) for line in execution_lines]
     return tuple(dict.fromkeys(normalized))
@@ -208,6 +212,23 @@ def _normalize_known_observation_execution_line(criterion: str) -> str:
     if key in _HELLO_AUTO_PYTEST_EQUIVALENTS:
         return "The exact command `uv run pytest tests/test_hello_auto.py` passes."
     return criterion
+
+
+def _canonical_hello_auto_observation_ac(context_text: str, criteria: tuple[str, ...]) -> str:
+    return_value = _extract_hello_auto_return_value("\n".join((context_text, *criteria)))
+    return _CANONICAL_HELLO_AUTO_OBSERVATION_AC.format(return_value=return_value)
+
+
+def _extract_hello_auto_return_value(text: str) -> str:
+    for pattern in (
+        r"hello_auto\(\)(?:\s*->\s*str)?\s+returns?\s+exactly\s+[`'\"]([^`'\"]+)[`'\"]",
+        r"must\s+return\s+exactly\s+[`'\"]([^`'\"]+)[`'\"]",
+        r"returning\s+exactly\s+[`'\"]([^`'\"]+)[`'\"]",
+    ):
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return "hello from ooo auto"
 
 
 def _is_observation_report_only_line(criterion: str) -> bool:

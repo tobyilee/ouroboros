@@ -1,6 +1,7 @@
 """Unit tests for ouroboros.persistence.event_store module."""
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 import logging
 
 import pytest
@@ -785,6 +786,53 @@ class TestSessionRelatedEvents:
         assert f"{execution_scope}_child_0" in aggregate_ids
         assert "other_evolve_ac_0" not in aggregate_ids
 
+    async def test_session_related_events_are_bounded_by_session_start(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        """Historical payload matches should not force full-history session scans."""
+        session_id = "sess-bounded-related"
+        execution_id = "exec-bounded-related"
+        session_started_at = datetime.now(UTC)
+        await event_store.append(
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                timestamp=session_started_at - timedelta(days=1),
+                aggregate_type="execution",
+                aggregate_id="old-runtime-scope",
+                data={"session_id": session_id, "message_count": 1},
+            )
+        )
+        await event_store.append(
+            BaseEvent(
+                type="orchestrator.session.started",
+                timestamp=session_started_at,
+                aggregate_type="session",
+                aggregate_id=session_id,
+                data={"execution_id": execution_id, "seed_id": "seed-bounded-related"},
+            )
+        )
+        await event_store.append(
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                timestamp=session_started_at + timedelta(seconds=1),
+                aggregate_type="execution",
+                aggregate_id="new-runtime-scope",
+                data={"session_id": session_id, "message_count": 1},
+            )
+        )
+
+        result = await event_store.query_session_related_events(
+            session_id,
+            execution_id=execution_id,
+            limit=None,
+        )
+        aggregate_ids = {event.aggregate_id for event in result}
+
+        assert "new-runtime-scope" in aggregate_ids
+        assert session_id in aggregate_ids
+        assert "old-runtime-scope" not in aggregate_ids
+
     async def test_execution_related_events_include_child_scopes(
         self,
         event_store: EventStore,
@@ -913,6 +961,51 @@ class TestSessionRelatedEvents:
 
         assert [event.type for event in second_batch] == ["execution.ac.heartbeat"]
         assert next_cursor > cursor
+
+    async def test_session_related_events_after_are_bounded_by_session_start(
+        self,
+        event_store: EventStore,
+    ) -> None:
+        """Incremental session polling must ignore stale pre-start payload matches."""
+        session_id = "sess-bounded-related-after"
+        execution_id = "exec-bounded-related-after"
+        session_started_at = datetime.now(UTC)
+        await event_store.append(
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                timestamp=session_started_at - timedelta(days=1),
+                aggregate_type="execution",
+                aggregate_id="old-runtime-scope",
+                data={"session_id": session_id, "message_count": 1},
+            )
+        )
+        await event_store.append(
+            BaseEvent(
+                type="orchestrator.session.started",
+                timestamp=session_started_at,
+                aggregate_type="session",
+                aggregate_id=session_id,
+                data={"execution_id": execution_id, "seed_id": "seed-bounded-related-after"},
+            )
+        )
+        await event_store.append(
+            BaseEvent(
+                type="execution.ac.heartbeat",
+                timestamp=session_started_at + timedelta(seconds=1),
+                aggregate_type="execution",
+                aggregate_id="new-runtime-scope",
+                data={"session_id": session_id, "message_count": 1},
+            )
+        )
+
+        events, cursor = await event_store.query_session_related_events_after(
+            session_id,
+            execution_id=execution_id,
+            last_row_id=0,
+        )
+
+        assert [event.aggregate_id for event in events] == [session_id, "new-runtime-scope"]
+        assert cursor > 0
 
     async def test_session_related_events_after_includes_exact_parent_execution_children(
         self,
