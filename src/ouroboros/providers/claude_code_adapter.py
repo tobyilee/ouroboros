@@ -76,11 +76,11 @@ _RETRYABLE_ERROR_PATTERNS = (
 def _claude_options_field_names() -> frozenset[str]:
     """Return parameter names accepted by ``ClaudeAgentOptions``.
 
-    Used to gate optional kwargs that may not exist across the supported
-    SDK pin range (``claude-agent-sdk>=0.1.0,<1.0.0``).  ``strict-mcp-config``
-    is only available via ``extra_args`` (CLI passthrough) on current SDK
-    versions; older releases may also lack ``extra_args`` itself, so we
-    detect support before forwarding instead of assuming a typed kwarg.
+    Used to gate optional kwargs that may not exist across published
+    ``claude-agent-sdk`` releases.  ``strict-mcp-config`` is only available
+    via ``extra_args`` (CLI passthrough) on current SDK versions; older
+    releases may also lack ``extra_args`` itself, so we detect support before
+    forwarding instead of assuming a typed kwarg.
     """
     try:
         from claude_agent_sdk import ClaudeAgentOptions  # noqa: PLC0415
@@ -770,24 +770,23 @@ class ClaudeCodeAdapter:
             # keep MCP-tool access intact.
             #
             # ``ClaudeAgentOptions`` does not expose ``strict_mcp_config``
-            # as a typed field across the supported SDK pin range
-            # (``claude-agent-sdk>=0.1.0,<1.0.0``); current releases accept
-            # the flag only via ``extra_args`` (CLI passthrough).
+            # as a typed field on published ``claude-agent-sdk`` releases;
+            # current releases accept the flag only via ``extra_args``
+            # (CLI passthrough).
             #
             # Compatibility invariant (verified against the published
             # PyPI history): ``extra_args`` has been a field on
             # ``ClaudeAgentOptions`` since the earliest published release
-            # (``claude-agent-sdk==0.0.23``) and remains present at every
-            # version in the declared support range, so the
-            # ``extra_args`` branch below is the path actually taken on
-            # any pip-installed SDK in that range.  The fail-fast branch
+            # (``claude-agent-sdk==0.0.23``) and is present on the pinned
+            # release, so the ``extra_args`` branch below is the path
+            # actually taken on any pip-installed SDK.  The fail-fast branch
             # is defense-in-depth against vendored, partial, or
             # monkey-patched SDK builds where the field has been removed:
             # we MUST honor the caller's isolation request rather than
             # silently re-open the recursion path.  ``test_factory.py``
             # and ``test_claude_code_adapter.py`` lock the live-SDK
-            # invariant so any future upper-bound bump that drops
-            # ``extra_args`` fails CI before reaching production.
+            # invariant so any future pin bump that drops ``extra_args``
+            # fails CI before reaching production.
             field_names = _claude_options_field_names()
             if "strict_mcp_config" in field_names:
                 options_kwargs["strict_mcp_config"] = True
