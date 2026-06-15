@@ -28,6 +28,44 @@ log = structlog.get_logger()
 DEFAULT_MODEL = "claude-sonnet-4-6"
 
 
+def _is_fable_or_mythos_5(model: str) -> bool:
+    normalized = model.lower()
+    return "fable-5" in normalized or "mythos-5" in normalized
+
+
+def _requires_adaptive_thinking_for_effort(model: str) -> bool:
+    """Return whether ``output_config.effort`` needs an explicit thinking mode.
+
+    Claude 5-series Fable/Mythos models run adaptive thinking by default and do
+    not require the ``thinking`` request field. Current Claude 4.6/4.7/4.8
+    effort examples pair ``output_config.effort`` with
+    ``thinking={"type": "adaptive"}``, so older model families get the
+    explicit envelope when the effort dial is set.
+    """
+    return not _is_fable_or_mythos_5(model)
+
+
+def _supports_sampling_and_prefill(model: str) -> bool:
+    """Return whether optional sampling knobs and assistant prefill are allowed."""
+    return not _is_fable_or_mythos_5(model)
+
+
+def _response_format_instruction(response_format: dict[str, object]) -> str:
+    """Translate Anthropic response_format into prompt steering without prefill."""
+    import json
+
+    fmt_type = response_format.get("type")
+    if fmt_type == "json_schema":
+        schema = response_format.get("json_schema", {})
+        schema_json = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+        return (
+            "Respond only with valid JSON that conforms to this JSON schema. "
+            f"Do not include prose or Markdown.\nSchema: {schema_json}"
+        )
+
+    return "Respond only with a valid JSON object. Do not include prose or Markdown."
+
+
 def _serialise_prompt_for_hash(
     api_messages: list[dict[str, str]],
     system_parts: list[str],
@@ -213,29 +251,48 @@ class AnthropicAdapter:
         if not api_messages:
             api_messages.append({"role": "user", "content": "(empty)"})
 
-        # Anthropic doesn't support response_format natively.
-        # Use assistant prefill to nudge JSON output when requested.
+        supports_sampling_and_prefill = _supports_sampling_and_prefill(model)
+
+        # Anthropic doesn't support response_format natively. Use assistant
+        # prefill where the model family supports it; Fable/Mythos 5 reject
+        # prefill, so steer JSON through system instructions instead.
         json_prefill = False
         if config.response_format and config.response_format.get("type") in (
             "json_object",
             "json_schema",
         ):
-            api_messages.append({"role": "assistant", "content": "{"})
-            json_prefill = True
+            if supports_sampling_and_prefill:
+                api_messages.append({"role": "assistant", "content": "{"})
+                json_prefill = True
+            else:
+                system_parts.append(_response_format_instruction(config.response_format))
 
         kwargs: dict[str, Any] = {
             "model": model,
             "messages": api_messages,
             "max_tokens": config.max_tokens,
-            "temperature": config.temperature,
-            "top_p": config.top_p,
         }
+
+        if supports_sampling_and_prefill:
+            kwargs["temperature"] = config.temperature
+            kwargs["top_p"] = config.top_p
 
         if system_parts:
             kwargs["system"] = "\n\n".join(system_parts)
 
         if config.stop:
             kwargs["stop_sequences"] = config.stop
+
+        # Effort-first investment dial (RFC #1405). The GA effort parameter lives
+        # under ``output_config.effort`` on current Claude models. It is paired
+        # with adaptive thinking for model families that still require an
+        # explicit thinking mode, and deliberately avoids the removed
+        # ``thinking.budget_tokens`` knob (which 400s on Opus 4.7+ / Fable 5).
+        # Omitted when unset to preserve prior behavior.
+        if config.reasoning_effort:
+            kwargs["output_config"] = {"effort": config.reasoning_effort}
+            if _requires_adaptive_thinking_for_effort(model):
+                kwargs["thinking"] = {"type": "adaptive"}
 
         log.debug(
             "anthropic.request.started",
@@ -250,7 +307,11 @@ class AnthropicAdapter:
                 prompt_text = _serialise_prompt_for_hash(
                     api_messages,
                     system_parts,
-                    {"top_p": config.top_p, "stop_sequences": config.stop},
+                    {
+                        "top_p": config.top_p,
+                        "stop_sequences": config.stop,
+                        "reasoning_effort": config.reasoning_effort,
+                    },
                 )
                 async with io_recorder.record_llm_call(
                     model_id=model,
@@ -258,7 +319,11 @@ class AnthropicAdapter:
                     caller="anthropic_adapter",
                     max_tokens=config.max_tokens,
                     temperature=config.temperature,
-                    extra={"top_p": config.top_p, "stop_sequences": config.stop},
+                    extra={
+                        "top_p": config.top_p,
+                        "stop_sequences": config.stop,
+                        "reasoning_effort": config.reasoning_effort,
+                    },
                 ) as call:
                     response = await client.messages.create(**kwargs)
                     parsed = self._parse_response(response, model, json_prefill)

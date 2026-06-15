@@ -363,3 +363,68 @@ def test_resolve_completion_profile_result_converts_config_error() -> None:
     assert isinstance(result.error, ProviderError)
     assert result.error.provider == "litellm"
     assert "Invalid LLM profile configuration" in result.error.message
+
+
+def test_resolve_completion_profile_threads_reasoning_effort() -> None:
+    """reasoning_effort coalesces provider > profile > request, like other params."""
+    config = OuroborosConfig(
+        llm_profiles={
+            "fast": {
+                "reasoning_effort": "low",
+                "providers": {
+                    "litellm": {"reasoning_effort": "medium"},
+                },
+            },
+            "plain": {"reasoning_effort": "high"},
+        },
+        llm_role_profiles={"qa": "fast", "seed_generation": "plain"},
+    )
+
+    with patch("ouroboros.providers.profiles.load_config", return_value=config):
+        # Provider override wins over the profile-level value.
+        provider_pref = resolve_completion_profile(
+            CompletionConfig(model="default", role="qa"), backend="litellm"
+        )
+        # Profile-level value applies when no provider override exists.
+        profile_pref = resolve_completion_profile(
+            CompletionConfig(model="default", role="seed_generation"), backend="litellm"
+        )
+
+    assert provider_pref.config.reasoning_effort == "medium"
+    assert profile_pref.config.reasoning_effort == "high"
+
+
+def test_resolve_completion_profile_role_effort_overrides_request_effort() -> None:
+    """Role profiles may set the investment dial even when sampling stays local."""
+    config = OuroborosConfig(
+        llm_profiles={"deep": {"reasoning_effort": "high", "temperature": 0.1}},
+        llm_role_profiles={"semantic_evaluation": "deep"},
+    )
+
+    with patch("ouroboros.providers.profiles.load_config", return_value=config):
+        resolved = resolve_completion_profile(
+            CompletionConfig(
+                model="default",
+                role="semantic_evaluation",
+                reasoning_effort="low",
+                temperature=0.8,
+            ),
+            backend="litellm",
+        )
+
+    assert resolved.config.reasoning_effort == "high"
+    assert resolved.config.temperature == 0.8
+
+
+def test_resolve_completion_profile_preserves_request_reasoning_effort() -> None:
+    """A request-level effort survives when no profile sets one."""
+    config = OuroborosConfig(
+        llm_profiles={"fast": {"temperature": 0.2}},
+        llm_role_profiles={"qa": "fast"},
+    )
+    with patch("ouroboros.providers.profiles.load_config", return_value=config):
+        resolved = resolve_completion_profile(
+            CompletionConfig(model="default", role="qa", reasoning_effort="low"),
+            backend="litellm",
+        )
+    assert resolved.config.reasoning_effort == "low"

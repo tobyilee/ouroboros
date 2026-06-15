@@ -162,6 +162,7 @@ class LLMProviderProfileConfig(BaseModel, frozen=True):
     max_tokens: int | None = Field(default=None, ge=1)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     max_turns: int | None = Field(default=None, ge=1)
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
 
 
 class LLMTaskProfileConfig(BaseModel, frozen=True):
@@ -172,6 +173,7 @@ class LLMTaskProfileConfig(BaseModel, frozen=True):
     max_tokens: int | None = Field(default=None, ge=1)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
     max_turns: int | None = Field(default=None, ge=1)
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
     providers: dict[str, LLMProviderProfileConfig] = Field(default_factory=dict)
 
 
