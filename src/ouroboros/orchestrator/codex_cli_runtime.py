@@ -64,6 +64,10 @@ _TOP_LEVEL_EVENT_MESSAGE_TYPES: dict[str, str] = {
 _INTERVIEW_SESSION_METADATA_KEY = "ouroboros_interview_session_id"
 
 _SAFE_SESSION_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# Effort levels Codex's ``model_reasoning_effort`` config key accepts. Used to
+# allow-list the value forwarded via ``-c model_reasoning_effort=<level>`` so an
+# unexpected effort string can never be injected into the override (RFC #1405).
+_CODEX_REASONING_EFFORT_LEVELS = frozenset({"minimal", "low", "medium", "high", "xhigh"})
 _MAX_LINE_BUFFER_BYTES = 50 * 1024 * 1024  # 50 MB
 _RUNTIME_PROFILE_ROLE_PREFIX = "agent_runtime"
 _RUNTIME_PROFILE_METADATA_KEYS = (
@@ -163,10 +167,19 @@ class CodexCliRuntime:
         # Codex composes the system prompt and tool guidance into the user
         # message rather than passing native runtime parameters; surface those
         # as TRANSLATED while preserving the default feature flags.
+        # Reasoning effort IS enforced natively: ``codex exec`` accepts a
+        # per-invocation ``-c model_reasoning_effort=<level>`` override (see
+        # _build_command), so the orchestrator's chosen level is honored, not
+        # merely advised.
         return replace(
             FULL_CAPABILITIES,
             system_prompt_support=ParamSupport.TRANSLATED,
             tool_restriction_support=ParamSupport.TRANSLATED,
+            reasoning_effort_support=ParamSupport.NATIVE,
+            # Codex enforces only the allow-listed levels (see _build_command); a
+            # level outside this set is silently dropped, so declare the vocabulary
+            # to keep enforced/advised classification truthful.
+            enforceable_reasoning_efforts=_CODEX_REASONING_EFFORT_LEVELS,
         )
 
     @property
@@ -806,6 +819,7 @@ class CodexCliRuntime:
         resume_session_id: str | None = None,
         prompt: str | None = None,
         runtime_handle: RuntimeHandle | None = None,
+        reasoning_effort: str | None = None,
     ) -> list[str]:
         """Build the CLI command args.  Prompt is fed via stdin separately."""
         command = [self._cli_path, "exec"]
@@ -827,6 +841,14 @@ class CodexCliRuntime:
                 self._cwd,
             ]
         )
+
+        # Effort-first investment dial (RFC #1405). ``codex exec`` honors a
+        # per-invocation config override, so the orchestrator's chosen level is
+        # ENFORCED (not advised) by overriding ``model_reasoning_effort``. Only
+        # a known-safe token is forwarded, so an unexpected value can never be
+        # injected into the ``key=value`` override.
+        if reasoning_effort and reasoning_effort in _CODEX_REASONING_EFFORT_LEVELS:
+            command.extend(["-c", f"model_reasoning_effort={reasoning_effort}"])
 
         normalized_model = self._normalize_model(self._model)
         if normalized_model:
@@ -1548,6 +1570,7 @@ class CodexCliRuntime:
         system_prompt: str | None = None,
         resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> AsyncIterator[AgentMessage]:
         """Execute a task via Codex CLI and stream normalized messages."""
         async for msg in self._execute_task_impl(
@@ -1556,6 +1579,7 @@ class CodexCliRuntime:
             system_prompt=system_prompt,
             resume_handle=resume_handle,
             resume_session_id=resume_session_id,
+            reasoning_effort=reasoning_effort,
             _resume_depth=0,
         ):
             yield msg
@@ -1567,6 +1591,7 @@ class CodexCliRuntime:
         system_prompt: str | None = None,
         resume_handle: RuntimeHandle | None = None,
         resume_session_id: str | None = None,
+        reasoning_effort: str | None = None,
         _resume_depth: int = 0,
     ) -> AsyncIterator[AgentMessage]:
         """Internal implementation with resume-depth tracking."""
@@ -1602,12 +1627,21 @@ class CodexCliRuntime:
         composed_prompt = self._compose_prompt(prompt, system_prompt, tools)
         attempted_resume_session_id = self._resolve_resume_session_id(current_handle)
         try:
-            command = self._build_command(
-                output_last_message_path=str(output_path),
-                resume_session_id=attempted_resume_session_id,
-                prompt=composed_prompt,
-                runtime_handle=current_handle,
-            )
+            build_kwargs: dict[str, Any] = {
+                "output_last_message_path": str(output_path),
+                "resume_session_id": attempted_resume_session_id,
+                "prompt": composed_prompt,
+                "runtime_handle": current_handle,
+            }
+            # Only hand the effort knob to a runtime whose ``_build_command``
+            # declares it. Codex (native) accepts it; advised CLI subclasses that
+            # share this base but expose no effort flag (e.g. Goose) do not override
+            # the signature, so forwarding ``None`` would raise an unexpected-kwarg
+            # TypeError. The orchestrator only sets a non-None level for runtimes
+            # that enforce it, so a None level is correctly dropped here.
+            if reasoning_effort is not None:
+                build_kwargs["reasoning_effort"] = reasoning_effort
+            command = self._build_command(**build_kwargs)
         except Exception as e:
             yield AgentMessage(
                 type="result",
@@ -1883,6 +1917,7 @@ class CodexCliRuntime:
                     tools=tools,
                     system_prompt=system_prompt,
                     resume_handle=recovery_handle,
+                    reasoning_effort=reasoning_effort,
                     _resume_depth=_resume_depth + 1,
                 ):
                     yield message
