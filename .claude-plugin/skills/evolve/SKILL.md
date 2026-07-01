@@ -45,12 +45,12 @@ ooo evolve --rewind <lineage_id> <generation_number>
 
 The Ouroboros MCP tools are often registered as **deferred tools** that must be explicitly loaded before use. **You MUST perform this step before deciding between Path A and Path B.**
 
-1. Use the `ToolSearch` tool to find and load the evolve MCP tools:
+1. Use the active runtime's tool-discovery capability to find and load the evolve MCP tools:
    ```
-   ToolSearch query: "+ouroboros evolve"
+   tool discovery query: "+ouroboros evolve"
    ```
-2. The tools will typically be named with prefix `mcp__plugin_ouroboros_ouroboros__` (e.g., `ouroboros_evolve_step`, `ouroboros_interview`, `ouroboros_generate_seed`). After ToolSearch returns, the tools become callable.
-3. If ToolSearch finds the tools → proceed to **Path A**. If not → proceed to **Path B**.
+2. The tools will typically be named with prefix `mcp__plugin_ouroboros_ouroboros__` (e.g., `ouroboros_evolve_step`, `ouroboros_interview`, `ouroboros_generate_seed`). After runtime tool discovery returns, the tools become callable.
+3. If the tools are callable — already exposed, or loaded by discovery — proceed to **Path A**. An empty discovery result for already-exposed tools is expected, not a failure. Proceed to **Path B** only if they are genuinely absent (no Ouroboros MCP server).
 
 **IMPORTANT**: Do NOT skip this step. Do NOT assume MCP tools are unavailable just because they don't appear in your immediate tool list. They are almost always available as deferred tools that need to be loaded first.
 
@@ -66,10 +66,10 @@ you are about to call**. Use `"+ouroboros evolve"` for `ouroboros_evolve_step`,
 `ouroboros_lineage_status`, and the evolve flow's documented tool family;
 use `"+ouroboros interview"` before `ouroboros_interview`, `"+ouroboros seed"`
 before `ouroboros_generate_seed`, and `"+ouroboros lateral"` before
-`ouroboros_lateral_think`. If a load returns no matching tool, switch to the
+`ouroboros_lateral_think`. If a load returns no matching tool (and the tool is not already callable — an empty load for an already-exposed tool is an expected no-op, not absence), switch to the
 documented fallback / Path B instead of retrying the failing call.
 
-### Path A: MCP Available (loaded via ToolSearch above)
+### Path A: MCP Available (loaded via runtime tool discovery above)
 
 **Starting a new evolutionary loop:**
 1. Parse the user's input as `initial_context`
