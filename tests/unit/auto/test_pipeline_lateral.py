@@ -27,9 +27,11 @@ from ouroboros.auto.lateral_routing import (
 )
 from ouroboros.auto.pipeline import (
     AutoPipeline,
+    _seed_with_recovery_constraint,
     _seed_with_seed_qa_feedback,
     _seed_with_seed_qa_lateral_feedback,
 )
+from ouroboros.auto.recovery_plan import AutoRecoveryPlan, RecoveryPlanAction
 from ouroboros.auto.seed_reviewer import SeedReview, SeedReviewer
 from ouroboros.auto.state import (
     _ALLOWED_TRANSITIONS,
@@ -175,6 +177,127 @@ def test_seed_qa_lateral_feedback_does_not_trip_intent_guard_pollution() -> None
     assert report.status is not IntentGuardStatus.FAIL
     spec_pollution = next(check for check in report.checks if check.code == "spec_pollution")
     assert spec_pollution.status is IntentGuardStatus.PASS
+
+
+def test_seed_qa_lateral_feedback_discards_persona_transcripts() -> None:
+    seed = _build_seed().model_copy(
+        update={"metadata": SeedMetadata(seed_id="seed_persona_transcript", ambiguity_score=0.12)}
+    )
+    lateral_result = LateralResult(
+        persona="contrarian",
+        approach_summary="Contrarian: Challenges assumptions",
+        text=(
+            "## Persona: Contrarian\n"
+            "EVALUATE failed. Current Approach (Not Working):\n"
+            "Most recent run artifact: goal: bad yaml"
+        ),
+    )
+
+    repaired = _seed_with_seed_qa_lateral_feedback(seed, lateral_result, attempt=1)
+    constraints = "\n".join(repaired.constraints)
+
+    assert "## Persona" not in constraints
+    assert "Contrarian" not in constraints
+    assert "Most recent run artifact" not in constraints
+    assert "without copying recovery persona prompts" in constraints
+
+
+def test_seed_qa_lateral_feedback_preserves_clean_summary_with_dirty_body() -> None:
+    seed = _build_seed().model_copy(
+        update={"metadata": SeedMetadata(seed_id="seed_mixed_lateral", ambiguity_score=0.12)}
+    )
+    lateral_result = LateralResult(
+        persona="hacker",
+        approach_summary="Rewrite ACs as exact command scenarios.",
+        text=(
+            "## Persona: Hacker\n"
+            "EVALUATE failed. Current Approach (Not Working):\n"
+            "Most recent run artifact: goal: bad yaml"
+        ),
+    )
+
+    repaired = _seed_with_seed_qa_lateral_feedback(seed, lateral_result, attempt=1)
+    constraints = "\n".join(repaired.constraints)
+
+    assert "Rewrite ACs as exact command scenarios" in constraints
+    assert "## Persona" not in constraints
+    assert "Most recent run artifact" not in constraints
+
+
+def test_seed_qa_lateral_feedback_discards_problem_context_body() -> None:
+    seed = _build_seed().model_copy(
+        update={"metadata": SeedMetadata(seed_id="seed_problem_context", ambiguity_score=0.12)}
+    )
+    lateral_result = LateralResult(
+        persona="architect",
+        approach_summary="Use the existing measurement command consistently.",
+        text=(
+            "_You see problems as structural, not just tactical._\n"
+            "## Problem Context\n"
+            "goal: Run a bounded Karpathy-style autoresearch loop\n"
+            "Concrete constraints for the generated Ouroboros Seed: ..."
+        ),
+    )
+
+    repaired = _seed_with_seed_qa_lateral_feedback(seed, lateral_result, attempt=1)
+    constraints = "\n".join(repaired.constraints)
+
+    assert "Use the existing measurement command consistently" in constraints
+    assert "Adopt this concrete implementation decision" not in constraints
+    assert "Problem Context" not in constraints
+    assert "Concrete constraints for the generated Ouroboros Seed" not in constraints
+
+
+def test_lateral_recovery_constraint_sanitizes_persona_transcripts() -> None:
+    seed = _build_seed()
+    plan = AutoRecoveryPlan(
+        action=RecoveryPlanAction.RALPH_REDISPATCH,
+        safe_to_redispatch=True,
+        reason="QA failed and lateral recovery advice is available.",
+        qa_score=0.58,
+        qa_verdict="revise",
+        differences=("bad contract",),
+        suggestions=("fix contract",),
+        persona="hacker",
+        instruction=(
+            "## Persona: Hacker\n"
+            "EVALUATE failed. Current Approach (Not Working): Most recent run artifact..."
+        ),
+    )
+
+    recovered = _seed_with_recovery_constraint(seed, plan)
+    constraints = "\n".join(recovered.constraints)
+
+    assert "## Persona" not in constraints
+    assert "Hacker" not in constraints
+    assert "Most recent run artifact" not in constraints
+    assert "Do not copy recovery persona prompts" in constraints
+
+
+def test_lateral_recovery_constraint_preserves_clean_prefix_with_dirty_body() -> None:
+    seed = _build_seed()
+    plan = AutoRecoveryPlan(
+        action=RecoveryPlanAction.RALPH_REDISPATCH,
+        safe_to_redispatch=True,
+        reason="QA failed and lateral recovery advice is available.",
+        qa_score=0.58,
+        qa_verdict="revise",
+        differences=("bad contract",),
+        suggestions=("fix contract",),
+        persona="hacker",
+        instruction=(
+            "Rewrite ACs as exact command scenarios.\n\n"
+            "## Persona: Hacker\n"
+            "EVALUATE failed. Current Approach (Not Working): Most recent run artifact..."
+        ),
+    )
+
+    recovered = _seed_with_recovery_constraint(seed, plan)
+    constraints = "\n".join(recovered.constraints)
+
+    assert "Rewrite ACs as exact command scenarios" in constraints
+    assert "## Persona" not in constraints
+    assert "Most recent run artifact" not in constraints
 
 
 class _StubInterviewDriver:

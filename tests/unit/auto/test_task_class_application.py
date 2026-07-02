@@ -71,6 +71,45 @@ def test_user_ac_appears_after_template_entries() -> None:
     assert applied.injected_ac == profile.default_ac_template
 
 
+def test_autoresearch_execution_contract_skips_generic_template() -> None:
+    seed = _seed(
+        ac=(
+            "Seed has explicit runtime context and non-goals sections for this autoresearch contract.",
+            "Execution records baseline val_bpb before train.py experiments.",
+        ),
+    ).model_copy(
+        update={
+            "constraints": (
+                "Runtime Context: local autoresearch repository with train.py.",
+                "Non-Goals: do not edit prepare.py.",
+            )
+        }
+    )
+
+    applied = apply_default_ac_template(seed, TaskClass.LIBRARY)
+
+    assert applied.injected_ac == ()
+    assert applied.seed is seed
+    assert not any("public API symbols" in item for item in seed.acceptance_criteria)
+
+
+def test_generic_cli_execution_contract_still_gets_template() -> None:
+    seed = _seed(
+        ac=("Command writes the requested file.",),
+    ).model_copy(
+        update={
+            "constraints": (
+                "Runtime Context: local CLI repository.",
+                "Non-Goals: no network calls.",
+            )
+        }
+    )
+
+    applied = apply_default_ac_template(seed, TaskClass.CLI)
+
+    assert applied.injected_ac == TASK_CLASS_CATALOG[TaskClass.CLI].default_ac_template
+
+
 def test_does_not_duplicate_when_user_already_supplied_one_template_entry() -> None:
     """If the user accidentally wrote one of the canonical template
     AC entries verbatim, the helper must not duplicate it."""
