@@ -49,6 +49,7 @@ from ouroboros.backends.capabilities import (
 )
 from ouroboros.core.seed_contract_prompt import render_auto_recursion_guard
 from ouroboros.core.types import Result
+from ouroboros.mcp.tools.assignment import AssignmentMessage
 from ouroboros.mcp.types import (
     ContentType,
     MCPContentItem,
@@ -775,6 +776,11 @@ def should_dispatch_via_plugin(
     keep their exact behaviour while the 3-way resolver becomes the source of
     truth. New code should prefer :func:`resolve_subagent_dispatch` to also
     distinguish ``HOST_DRIVEN`` from ``SEQUENTIAL``.
+
+    The envelope path is specifically the host-bridge/passive-plugin mode: a
+    host plugin spawns the child out-of-band. Leader-driven worker-pool runtimes
+    do not emit a passive plugin envelope; they are routed through
+    ``HOST_DRIVEN`` by the resolver instead.
 
     Args:
         runtime_backend: Resolved agent runtime backend name.
@@ -1552,45 +1558,55 @@ def build_execute_subagent(
     model_tier: str | None = "medium",
     max_parallel_workers: int | None = None,
 ) -> SubagentPayload:
-    """Build subagent payload for seed execution."""
-    seed_path_note = ""
+    """Build subagent payload for seed execution.
+
+    The child receives a typed ``AssignmentMessage`` (TASK / DELIVERABLE / SCOPE
+    / VERIFY) so the work order is a self-contained contract rather than free
+    prose: SCOPE carries the session, limits, working dir and worker cap; VERIFY
+    states the evidence that gates completion (acceptance criteria + QA). The
+    seed specification and recursion guard travel in the assignment body.
+    """
+    scope_lines: list[str] = [
+        f"Session ID: {session_id or 'new'}",
+        f"Max Iterations: {max_iterations}",
+    ]
     if seed_path:
-        seed_path_note = f"\n## Seed File Path\n{seed_path}\n"
-
-    cwd_note = ""
+        scope_lines.append(f"Seed File Path: {seed_path}")
     if cwd:
-        cwd_note = f"\n## Working Directory\n{cwd}\n"
-
-    qa_note = ""
-    if skip_qa:
-        qa_note = "\n## QA\nSkip QA after execution.\n"
-    else:
-        qa_note = "\n## QA\nRun QA evaluation after execution completes.\n"
-
-    workers_note = ""
+        scope_lines.append(f"Working Directory: {cwd}")
     if max_parallel_workers is not None:
-        workers_note = f"\n## Max Parallel Workers\n{max_parallel_workers}\n"
+        scope_lines.append(f"Max Parallel Workers: {max_parallel_workers}")
 
-    prompt = f"""## Your Task
+    if skip_qa:
+        qa_verify = "QA is skipped for this run — still confirm every acceptance criterion is met."
+    else:
+        qa_verify = "Run QA evaluation after execution completes and confirm it passes."
 
-Execute the following seed specification. Implement all requirements defined
-in the seed, respecting constraints and acceptance criteria.
+    seed_body = (
+        "## Seed Specification\n"
+        "```yaml\n"
+        f"{seed_content}\n"
+        "```\n\n"
+        f"{render_auto_recursion_guard()}\n\n"
+        "Work iteratively, testing as you go. Stop when all acceptance criteria "
+        "are met or max iterations reached."
+    )
 
-## Session ID
-{session_id or "new"}
-
-## Max Iterations
-{max_iterations}
-{seed_path_note}{cwd_note}{qa_note}{workers_note}
-## Seed Specification
-```yaml
-{seed_content}
-```
-
-{render_auto_recursion_guard()}
-
-Implement the seed requirements. Work iteratively, testing as you go.
-Stop when all acceptance criteria are met or max iterations reached."""
+    prompt = AssignmentMessage(
+        task=(
+            "Execute the seed specification below. Implement every requirement, "
+            "respecting all constraints and acceptance criteria."
+        ),
+        deliverable=(
+            "A working implementation in which every acceptance criterion in the seed is satisfied."
+        ),
+        scope=tuple(scope_lines),
+        verify=(
+            "Every acceptance criterion in the seed is satisfied.",
+            qa_verify,
+        ),
+        body=seed_body,
+    ).render()
 
     context: dict[str, Any] = {
         "seed_content": seed_content,
