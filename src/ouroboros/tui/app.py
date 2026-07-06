@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from textual.app import App
 from textual.binding import Binding
 
+from ouroboros.dashboard.board import ProviderLedger, fold_provider_event
 from ouroboros.tui.events import (
     ACUpdated,
     AgentThinkingUpdated,
@@ -272,6 +273,10 @@ class OuroborosTUI(App[None]):
         self._event_store = event_store
         self._execution_id: str | None = execution_id
         self._state = TUIState()
+        # Provider identity ledger — the SAME derivation reduce_board uses for the
+        # web Kanban, folded incrementally (O(1) per event). It wraps the state's
+        # ``provider_by_node`` dict so folds merge in place, never replace it.
+        self._provider_ledger = ProviderLedger(provider_by_node=self._state.provider_by_node)
         self._subscription_task: asyncio.Task[None] | None = None
         self._subscription_generation = 0
         self._poll_interval_seconds = 0.5
@@ -370,6 +375,11 @@ class OuroborosTUI(App[None]):
             self.post_message(message)
             self._update_state_from_event(event)
 
+        # Fold provider identity through the SHARED board derivation (the exact
+        # rules the web Kanban's reduce_board applies). Additive: it only annotates
+        # provider tags and never touches pause/resume/log/debug flows above.
+        self._ingest_board_event(event)
+
         # Forward raw event to debug screen
         try:
             debug_screen = self.get_screen("debug")
@@ -385,6 +395,27 @@ class OuroborosTUI(App[None]):
                 )
         except Exception:
             pass  # Screen might not be installed yet
+
+    def _ingest_board_event(self, event: BaseEvent) -> None:
+        """Fold one event's provider identity through the shared board derivation.
+
+        The TUI keeps its own hierarchical ``ac_tree`` for layout, but derives
+        per-node PROVIDER (runtime_backend) via the exact same rules the web
+        Kanban's ``reduce_board`` applies (``fold_provider_event`` is called by
+        both) — so the two surfaces can never drift on who ran what. The fold is
+        O(1) per event and mutates the ledger in place; no event list is kept.
+        Rendering is refreshed ONLY when provider identity actually changed — a
+        handful of times per run — never on node/status/tool chatter.
+        """
+        data = event.data if isinstance(event.data, dict) else {}
+        if not fold_provider_event(event.type, data, ledger=self._provider_ledger):
+            return
+
+        self._state.board_providers[:] = self._provider_ledger.providers()
+        # Stamp providers onto any tree nodes that already exist. Nodes created
+        # later (by queued Textual messages) get stamped at their own
+        # ``_notify_ac_tree_updated`` via ``_apply_provider_tags``.
+        self._notify_ac_tree_updated()
 
     async def _subscribe_to_events(self, context: _EventSubscriptionContext) -> None:
         """Subscribe to EventStore for live updates.
@@ -533,6 +564,10 @@ class OuroborosTUI(App[None]):
         self._state.active_tools.clear()
         self._state.tool_history.clear()
         self._state.thinking.clear()
+        # Wipe folded provider identity for the next run. The ledger wraps the
+        # state's provider_by_node dict, so resetting it clears both.
+        self._provider_ledger.reset()
+        self._state.board_providers.clear()
         self._state.add_log("info", "tui.main", f"Monitoring execution: {execution_id}")
         # Forward to logs screen
         try:
@@ -991,8 +1026,37 @@ class OuroborosTUI(App[None]):
         if dashboard is not None and hasattr(dashboard, method_name):
             getattr(dashboard, method_name)(message)
 
+    def _apply_provider_tags(self) -> None:
+        """Stamp per-node provider onto ac_tree nodes from the shared derivation.
+
+        Single choke point: whatever built/mutated the tree, the provider tag is
+        applied here right before the widget renders, keyed by node_id — so a
+        provider learned before OR after its node was created still lands.
+        Resolution matches reduce_board's per-card rule exactly (per-worker
+        provider wins, run-level backend is the fallback); the structural root is
+        not a board card and is never tagged.
+        """
+        ledger = self._provider_ledger
+        if not ledger.provider_by_node and not ledger.run_provider:
+            return
+        nodes = self._state.ac_tree.get("nodes")
+        if not isinstance(nodes, dict):
+            return
+        root_id = self._state.ac_tree.get("root_id", "root")
+        for node_id, node in nodes.items():
+            if node_id == root_id or not isinstance(node, dict):
+                continue
+            provider = (
+                ledger.provider_by_node.get(node_id)
+                or ledger.provider_by_node.get(str(node.get("node_id") or ""))
+                or ledger.run_provider
+            )
+            if provider:
+                node["provider"] = provider
+
     def _notify_ac_tree_updated(self) -> None:
         """Notify dashboard that AC tree has been updated."""
+        self._apply_provider_tags()
         dashboard = self._get_dashboard_screen()
         if dashboard is not None and hasattr(dashboard, "_tree") and dashboard._tree is not None:
             dashboard._tree.update_tree(self._state.ac_tree)

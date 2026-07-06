@@ -606,6 +606,15 @@ class TUIState:
     logs: list[dict[str, Any]] = field(default_factory=list)
     max_logs: int = 100
 
+    # Provider identity, folded incrementally through the SHARED board derivation
+    # (``ouroboros.dashboard.board.fold_provider_event`` — the exact rules
+    # ``reduce_board`` applies for the web Kanban). ``provider_by_node`` maps
+    # node_id -> runtime_backend (codex_cli / claude / …) for per-worker sessions;
+    # the app's ``ProviderLedger`` wraps this dict and adds the run-level fallback
+    # when stamping tree nodes. ``board_providers`` is the run's provider legend.
+    provider_by_node: dict[str, str] = field(default_factory=dict)
+    board_providers: list[str] = field(default_factory=list)
+
     # P1: Tool/thinking tracking for dashboard
     active_tools: dict[str, dict[str, str]] = field(default_factory=dict)
     tool_history: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
