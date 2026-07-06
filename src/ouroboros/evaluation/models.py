@@ -189,6 +189,10 @@ class ConsensusResult:
     majority_ratio: float
     disagreements: tuple[str, ...] = ()
     is_single_model: bool = False
+    # PR-X X2: honest label of executor/reviewer independence
+    # ("independent" | "same_vendor" | "unavailable" | "unverified" |
+    # None when not resolved). See evaluation.reviewer_independence.
+    reviewer_independence: str | None = None
 
     @property
     def approving_votes(self) -> int:
@@ -323,6 +327,10 @@ class EvaluationContext:
     constraints: tuple[str, ...] = ()
     artifact_bundle: ArtifactBundle | None = None
     trigger_consensus: bool = False
+    # PR-X X2: the runtime backend that produced ``artifact``, when known. Lets
+    # consensus keep the executor's own vendor out of the reviewer jury. ``None``
+    # (the default) means "unknown" — today's behavior, no independence binding.
+    executor_backend: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
