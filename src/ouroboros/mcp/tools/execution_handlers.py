@@ -35,6 +35,7 @@ from ouroboros.core.worktree import (
 from ouroboros.evaluation.verification_artifacts import build_verification_artifacts
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
 from ouroboros.mcp.job_manager import JobLinks, JobManager
+from ouroboros.mcp.tools._dashboard import resolve_dashboard_run_url
 from ouroboros.mcp.tools.background import start_background_tool_job
 from ouroboros.mcp.tools.bridge_mixin import BridgeAwareMixin
 from ouroboros.mcp.tools.subagent import (
@@ -1009,6 +1010,14 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     f"LLM Backend: {resolved_llm_backend}\n"
                 )
                 message += _run_only_verification_text(tracker.session_id)
+                # Best-effort live dashboard URL (singleton daemon, reused across
+                # runs; default on, opt out via OUROBOROS_DASHBOARD=0). Offloaded
+                # to a thread so the healthz/first-spawn wait never blocks the loop.
+                dashboard_url = await resolve_dashboard_run_url(
+                    tracker.execution_id, self.event_store
+                )
+                if dashboard_url:
+                    message += f"Live Dashboard: {dashboard_url}\n"
                 if pause_metadata:
                     if pause_metadata.get("pause_kind") is not None:
                         message += f"Pause Kind: {pause_metadata['pause_kind']}\n"
@@ -1039,6 +1048,7 @@ class ExecuteSeedHandler(BridgeAwareMixin):
                     "runtime_backend": effective_runtime_backend,
                     "llm_backend": resolved_llm_backend,
                     "resume_requested": is_resume,
+                    **({"dashboard_url": dashboard_url} if dashboard_url else {}),
                     **_run_only_verification_meta(tracker.session_id),
                 }
                 if success is not None:
@@ -1735,13 +1745,18 @@ class StartExecuteSeedHandler:
         except (ValueError, Exception):
             llm_backend = "unknown"
 
+        dashboard_url = await resolve_dashboard_run_url(
+            snapshot.links.execution_id or execution_id, self._event_store
+        )
+        dashboard_line = f"Live Dashboard: {dashboard_url}\n" if dashboard_url else ""
         text = (
             f"Started background execution.\n\n"
             f"Job ID: {snapshot.job_id}\n"
             f"Session ID: {snapshot.links.session_id or 'pending'}\n"
             f"Execution ID: {snapshot.links.execution_id or 'pending'}\n\n"
             f"Runtime Backend: {runtime_backend}\n"
-            f"LLM Backend: {llm_backend}\n\n"
+            f"LLM Backend: {llm_backend}\n"
+            f"{dashboard_line}\n"
             f"{_run_only_verification_text(snapshot.links.session_id)}\n"
             "Use ouroboros_ac_tree_hud(session_id, cursor) for live progress and "
             "ouroboros_job_result(job_id) for the final output."
@@ -1750,6 +1765,7 @@ class StartExecuteSeedHandler:
             "job_id": snapshot.job_id,
             "session_id": snapshot.links.session_id,
             "execution_id": snapshot.links.execution_id,
+            **({"dashboard_url": dashboard_url} if dashboard_url else {}),
             "status": snapshot.status.value,
             "cursor": snapshot.cursor,
             "runtime_backend": runtime_backend,

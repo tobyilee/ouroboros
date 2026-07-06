@@ -75,6 +75,7 @@ from ouroboros.core.file_lock import file_lock
 from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
 from ouroboros.mcp.job_manager import JobLinks, JobManager, JobSnapshot, JobStatus
+from ouroboros.mcp.tools._dashboard import resolve_dashboard_base_url
 from ouroboros.mcp.tools.authoring_handlers import GenerateSeedHandler, InterviewHandler
 from ouroboros.mcp.tools.background import start_background_tool_job
 from ouroboros.mcp.tools.evaluation_handlers import LateralThinkHandler
@@ -884,11 +885,14 @@ class StartAutoHandler:
                 )
             )
 
+        dashboard_url = await resolve_dashboard_base_url(self._event_store)
+        dashboard_line = f"Live Dashboard: {dashboard_url}\n" if dashboard_url else ""
         text = (
             "Started background auto session.\n\n"
             "Status: queued\n"
             f"job_id: {snapshot.job_id}\n"
-            f"auto_session_id: {auto_session_id}\n\n"
+            f"auto_session_id: {auto_session_id}\n"
+            f"{dashboard_line}\n"
             "Track with ouroboros_job_wait / ouroboros_job_status until terminal, "
             "then fetch ouroboros_job_result."
         )
@@ -900,6 +904,7 @@ class StartAutoHandler:
                     "job_id": snapshot.job_id,
                     "auto_session_id": auto_session_id,
                     "session_id": auto_session_id,
+                    **({"dashboard_url": dashboard_url} if dashboard_url else {}),
                     "status": "queued",
                     "dispatch_mode": "job",
                     "status_tool": "ouroboros_job_status",
