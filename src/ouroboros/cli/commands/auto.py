@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+from dataclasses import replace
 from enum import Enum
 import os
 from pathlib import Path
+import time
 from typing import Annotated
 
 from rich.markup import escape as _rich_escape
@@ -50,17 +53,25 @@ from ouroboros.auto.state import (
     AutoCommitPolicy,
     AutoPhase,
     AutoPipelineState,
+    AutoResumeCapability,
     AutoStore,
     parse_auto_worktree_policy,
     validate_complete_product_timeout,
 )
 from ouroboros.auto.worktree import ensure_auto_worktree, release_auto_worktree
 from ouroboros.cli.formatters import console
-from ouroboros.cli.formatters.panels import print_error, print_info, print_success
+from ouroboros.cli.formatters.panels import (
+    print_error,
+    print_info,
+    print_success,
+    print_warning,
+)
 from ouroboros.config import get_opencode_mode
+from ouroboros.mcp.job_manager import JobManager, JobSnapshot, JobStatus
 from ouroboros.mcp.tools.authoring_handlers import GenerateSeedHandler, InterviewHandler
 from ouroboros.mcp.tools.evaluation_handlers import LateralThinkHandler
 from ouroboros.mcp.tools.execution_handlers import ExecuteSeedHandler, StartExecuteSeedHandler
+from ouroboros.mcp.tools.job_handlers import JobResultHandler, JobWaitHandler
 from ouroboros.mcp.tools.qa import QAHandler
 from ouroboros.mcp.tools.ralph_handlers import RalphHandler
 from ouroboros.mcp.tools.subagent import should_dispatch_via_plugin
@@ -167,6 +178,20 @@ def auto_command(
     skip_run: Annotated[
         bool, typer.Option("--skip-run", help="Stop after A-grade Seed creation.")
     ] = False,
+    no_wait: Annotated[
+        bool,
+        typer.Option(
+            "--no-wait",
+            help=(
+                "Fire-and-forget: return as soon as the execute run-handoff job is "
+                "started instead of waiting for it to finish. WARNING: in direct CLI "
+                "mode the in-process job dies with the CLI, so detached execution does "
+                "NOT survive process exit unless a persistent owner (e.g. a running "
+                "'ouroboros mcp serve') holds it. Default off: auto waits for the run "
+                "job to reach a terminal state and reports the verdict."
+            ),
+        ),
+    ] = False,
     show_ledger: Annotated[
         bool, typer.Option("--show-ledger", help="Print assumptions and non-goals.")
     ] = False,
@@ -218,6 +243,9 @@ def auto_command(
                 "Top-level pipeline deadline in seconds. Defaults to "
                 f"{DEFAULT_PIPELINE_TIMEOUT_SECONDS:g}s (2h) for new sessions. "
                 f"Range: {MIN_PIPELINE_TIMEOUT_SECONDS:g}-{MAX_PIPELINE_TIMEOUT_SECONDS:g}. "
+                "The same deadline also bounds the default run-handoff wait: "
+                "on expiry the run job is cancelled cleanly and auto reports a "
+                "blocked (resumable) verdict. "
                 "On resume the deadline is preserved across process restarts; "
                 "passing --timeout on resume is rejected."
             ),
@@ -265,8 +293,10 @@ def auto_command(
 ) -> None:
     """Run an A-grade-gated auto pipeline.
 
-    The command returns execution IDs after the run starts; it does not wait
-    indefinitely for long-running execution completion.
+    By default the command waits for the execute run-handoff job to reach a
+    terminal state and reports the run verdict, because in direct CLI mode the
+    in-process job manager dies with the process and would otherwise cancel the
+    run on exit. Pass ``--no-wait`` to restore fire-and-forget behaviour.
     """
     if status:
         if not resume:
@@ -311,6 +341,7 @@ def auto_command(
                 commit_policy=commit_policy,
                 worktree_policy=worktree_policy,
                 progress_callback=_make_progress_renderer(quiet=quiet),
+                wait=not no_wait,
             )
         )
     except typer.Exit:
@@ -320,6 +351,13 @@ def auto_command(
         raise typer.Exit(1) from exc
 
     _print_result(result, show_ledger=show_ledger)
+    if no_wait and _is_run_handoff_only_completion(result) and result.job_id:
+        print_warning(
+            "Detached with --no-wait: the execute job runs in this CLI process only. "
+            "It will NOT survive process exit unless a persistent owner (e.g. a running "
+            "'ouroboros mcp serve') holds it. Re-run without --no-wait to wait for the "
+            f"run verdict, or track it with: ouroboros job wait {result.job_id}"
+        )
     if result.status in {"blocked", "failed"}:
         raise typer.Exit(1)
 
@@ -359,6 +397,7 @@ async def _run_auto(
     commit_policy: str | None = None,
     worktree_policy: str | None = None,
     progress_callback: AutoProgressCallback | None = None,
+    wait: bool = True,
 ) -> AutoPipelineResult:
     store = AutoStore()
     runtime_override = runtime
@@ -647,6 +686,31 @@ async def _run_auto(
     )
     try:
         result = await pipeline.run(state)
+        if wait and _is_run_handoff_only_completion(result) and result.job_id:
+            # Direct CLI mode has no long-lived owner for the in-process job:
+            # once _run_auto returns, ``asyncio.run`` teardown cancels the
+            # pending execute-job task (see mcp/job_manager.py drain docstring
+            # + the _run_job CancelledError handler), so the run would die at
+            # ~200ms without ever executing. Keep the event loop alive and
+            # stream the run to a terminal verdict before returning.
+            result = await _await_run_handoff_terminal(
+                result,
+                job_manager=getattr(start_execute, "_job_manager", None),
+                event_store=getattr(start_execute, "_event_store", None),
+                quiet=progress_callback is None,
+                # Bound the wait by the SAME top-level pipeline deadline the
+                # CLI --timeout contract advertises: the pipeline consumed
+                # part of the budget, the wait gets the remainder. When the
+                # deadline was never armed (defensive), a fresh
+                # pipeline_timeout_seconds window applies — never unbounded.
+                deadline_at=state.deadline_at,
+                fallback_timeout_seconds=float(state.pipeline_timeout_seconds),
+                # Correct the durable state (out of the pipeline's premature
+                # COMPLETE) on a non-success verdict so a later --resume
+                # reconciles the run instead of returning stale complete.
+                state=state,
+                store=store,
+            )
     finally:
         release_auto_worktree(auto_workspace)
         await watchdog_event_store.close()
@@ -834,6 +898,380 @@ def _is_completed_ralph_product(result: AutoPipelineResult) -> bool:
 def _is_external_ralph_plugin_completion(result: AutoPipelineResult) -> bool:
     """True when auto is complete but product work lives in an OpenCode child."""
     return result.status == "complete" and result.ralph_dispatch_mode == "plugin"
+
+
+# Long-poll window (seconds) for each ``JobWaitHandler`` call while streaming
+# the run-handoff job to a terminal verdict. The handler returns early on any
+# AC/phase progress or terminal status, so this is only an upper bound on how
+# long a fully-idle poll blocks before we re-check the snapshot.
+_RUN_HANDOFF_WAIT_POLL_SECONDS = 5
+
+
+async def _cancel_run_handoff_job(job_manager: JobManager, job_id: str) -> None:
+    """Best-effort cancel of the in-process run job (Ctrl-C / teardown path)."""
+    cancel_job = getattr(job_manager, "cancel_job", None)
+    if cancel_job is None:
+        return
+    with contextlib.suppress(Exception):
+        await cancel_job(job_id)
+
+
+_FAILED_RUN_META_STATUSES = frozenset({"failed", "cancelled", "interrupted"})
+
+
+def _run_meta_verdict(snapshot: JobSnapshot) -> tuple[str, bool | None]:
+    """Extract the execution-level (status, success) verdict from a job snapshot.
+
+    ``ExecuteSeedHandler`` maps the reconstructed session status into the tool
+    result meta (``_classify_synchronous_execution_status``): a PAUSED
+    execution — e.g. a usage-limit pause — completes the JOB with
+    ``result_meta={"status": "paused", "success": None}``. The job lifecycle
+    status alone is therefore not a run verdict. Mirrors the meta fallback of
+    ``auto/adapters._wait_for_job_terminal`` (``status`` defaults to the job's
+    own terminal status when the inner result did not provide one).
+    """
+    meta = snapshot.result_meta or {}
+    raw_status = meta.get("status")
+    status = (
+        raw_status.strip().lower()
+        if isinstance(raw_status, str) and raw_status.strip()
+        else snapshot.status.value
+    )
+    raw_success = meta.get("success")
+    success = raw_success if isinstance(raw_success, bool) else None
+    return status, success
+
+
+def _reconcile_run_handoff_result(
+    result: AutoPipelineResult, snapshot: JobSnapshot
+) -> AutoPipelineResult:
+    """Project a terminal execute-job snapshot back onto the auto result.
+
+    Mirrors ``mcp/tools/auto_handler._reconcile_execution_job_snapshot`` for
+    the job lifecycle, and the complete-product resume gate in
+    ``auto/pipeline.py`` (persisted-handle branch) for the execution-level
+    verdict carried in ``result_meta``: a COMPLETED job is only a successful
+    run when its meta confirms terminal success; ``status == "paused"`` keeps
+    the session resumable and never reports complete.
+
+    TODO(Q00/ouroboros#1590): extract a shared job→auto-result reconciliation
+    helper with ``mcp/tools/auto_handler._reconcile_execution_job_snapshot``
+    instead of mirroring its semantics here (kept out of this PR to avoid
+    touching the MCP path).
+    """
+    status = result.status
+    blocker = result.blocker
+    # Do NOT inherit ``result.resume_capability``: for a COMPLETE handoff the
+    # pipeline emits ``AutoResumeCapability.NONE`` (see
+    # ``AutoPipelineState.resume_capability()`` — COMPLETE -> NONE). Each branch
+    # below sets the capability explicitly so a blocked-but-resumable run
+    # (paused / unknown-success / deadline) is upgraded to RESUME regardless of
+    # the incoming COMPLETE->NONE, while genuine success stays NONE and genuine
+    # failure keeps NONE.
+    resume_capability = result.resume_capability
+    if snapshot.status is JobStatus.COMPLETED:
+        run_status, run_success = _run_meta_verdict(snapshot)
+        if run_status == "paused":
+            # The JOB completed but the EXECUTION paused (usage-limit etc.).
+            # Same contract as the pipeline's resume gate: block with resume
+            # guidance and keep the persisted run handle resumable.
+            status = "blocked"
+            resume_capability = AutoResumeCapability.RESUME
+            blocker = (
+                "run execution paused before completion; resume the paused "
+                f"run before continuing (auto session {result.auto_session_id}, "
+                f"job {snapshot.job_id})"
+            )
+        elif run_success is False or run_status in _FAILED_RUN_META_STATUSES:
+            detail = snapshot.error or snapshot.result_text or snapshot.message
+            blocker = f"run execution finished unsuccessfully: {run_status}" + (
+                f" — {detail}" if detail else ""
+            )
+            status = "failed"
+            resume_capability = AutoResumeCapability.NONE
+        elif run_success is not True and run_status != "completed":
+            # Allowlist gate (pipeline parity): terminal job metadata without
+            # an explicit success signal is NOT evidence of run success.
+            status = "blocked"
+            resume_capability = AutoResumeCapability.RESUME
+            blocker = (
+                "execution job completed without confirming terminal run "
+                f"success (status={run_status!r}, success={run_success!r}); "
+                "inspect the run before treating the product as complete "
+                f"(auto session {result.auto_session_id}, job {snapshot.job_id})"
+            )
+        else:
+            status = "complete"
+            blocker = None
+            resume_capability = AutoResumeCapability.NONE
+    elif snapshot.status in {JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.INTERRUPTED}:
+        detail = snapshot.error or snapshot.result_text or snapshot.message
+        blocker = (
+            f"execution job {snapshot.status.value}: {detail}"
+            if detail
+            else f"execution job {snapshot.status.value}"
+        )
+        if snapshot.status is JobStatus.FAILED:
+            # Genuine failure: keep the failure (non-resumable) capability.
+            status = "failed"
+            resume_capability = AutoResumeCapability.NONE
+        else:
+            # Cancelled/interrupted mid-run is resumable, not a dead end.
+            status = "blocked"
+            resume_capability = AutoResumeCapability.RESUME
+    else:
+        # Non-terminal snapshot (should not happen after a terminal wait): keep
+        # the handoff-only result intact and only surface the live status.
+        return replace(result, execution_job_status=snapshot.status.value)
+    return replace(
+        result,
+        status=status,
+        phase="complete" if status == "complete" else result.phase,
+        blocker=blocker,
+        resume_capability=resume_capability,
+        execution_job_status=snapshot.status.value,
+        execution_job_error=snapshot.error,
+        execution_job_message=snapshot.message,
+    )
+
+
+# Grace window (seconds) after a deadline-driven cancel for the job's
+# CancelledError handler to persist its terminal ``mcp.job.cancelled`` event,
+# so the bounded verdict reports the post-cancel terminal status.
+_RUN_HANDOFF_CANCEL_GRACE_SECONDS = 5.0
+
+
+def _run_wait_deadline_result(
+    result: AutoPipelineResult, snapshot: JobSnapshot
+) -> AutoPipelineResult:
+    """Bounded verdict for a run wait that exhausted the pipeline deadline.
+
+    Same shape as the paused reconciliation: NOT complete, blocked with the
+    resume handle and guidance. ``resume_capability`` is set explicitly to
+    RESUME (not inherited): the incoming COMPLETE handoff result carries
+    ``AutoResumeCapability.NONE``, but a deadline-cancelled run IS resumable.
+    """
+    return replace(
+        result,
+        status="blocked",
+        resume_capability=AutoResumeCapability.RESUME,
+        blocker=(
+            "run wait deadline exhausted (top-level pipeline --timeout budget); "
+            f"cancelled run job {snapshot.job_id}. The product run did NOT "
+            "complete. Resume with: ouroboros auto --resume "
+            f"{result.auto_session_id}"
+        ),
+        execution_job_status=snapshot.status.value,
+        execution_job_error=snapshot.error,
+        execution_job_message=snapshot.message,
+    )
+
+
+async def _cancel_run_and_build_deadline_result(
+    result: AutoPipelineResult,
+    job_manager: JobManager,
+    job_id: str,
+    snapshot: JobSnapshot,
+) -> AutoPipelineResult:
+    """Cancel the run job on deadline expiry and return the bounded verdict."""
+    await _cancel_run_handoff_job(job_manager, job_id)
+    print_warning(
+        f"Run wait deadline reached — cancelled run job {job_id}. "
+        f"Resume with: ouroboros auto --resume {result.auto_session_id}"
+    )
+    # Short grace so the cancel lands as a terminal event before reporting.
+    grace_deadline = time.monotonic() + _RUN_HANDOFF_CANCEL_GRACE_SECONDS
+    with contextlib.suppress(Exception):
+        while time.monotonic() < grace_deadline:
+            snapshot = await job_manager.get_snapshot(job_id)
+            if snapshot.is_terminal:
+                break
+            await asyncio.sleep(0.05)
+    return _run_wait_deadline_result(result, snapshot)
+
+
+def _persist_resumable_run_verdict(
+    result: AutoPipelineResult,
+    state: AutoPipelineState | None,
+    store: AutoStore | None,
+) -> AutoPipelineResult:
+    """Persist a non-success run verdict onto the durable auto state.
+
+    ``AutoPipeline.run`` saved the durable state as ``AutoPhase.COMPLETE`` when
+    the run handoff started. If the wait then observed the run finish in a
+    non-success terminal, the in-memory ``result`` is corrected but the DURABLE
+    state is still COMPLETE — so a later plain ``ouroboros auto --resume`` would
+    hit the ``pipeline.run`` COMPLETE fast-path and return the stale
+    product-complete. Correct the durable state so the two disagree no more,
+    distinguishing the two kinds of non-success outcome:
+
+    * ``status == "blocked"`` — a *resumable* outcome (paused execution,
+      deadline-cancelled, interrupt-cancelled, cancelled/interrupted job, or an
+      unknown-success handle). Reopen the durable state to ``RUN`` so
+      ``--resume`` reconciles the owned job, and take the in-memory
+      ``resume_capability`` from the durable state (RESUME).
+    * ``status == "failed"`` — a *genuine* run failure (job ``FAILED`` /
+      ``success is False``). Preserve the failed terminal contract: persist a
+      durable ``FAILED`` phase (NOT reopened to RUN), and keep the reconciled
+      capability (``NONE``) — ``--resume`` must not retry an already-failed run.
+
+    Genuine success (``status == "complete"``) leaves the durable state
+    COMPLETE and is returned unchanged (fast-path intact).
+    """
+    if state is None:
+        return result
+    if result.status == "blocked":
+        reopened = state.reopen_completed_run_handoff_to_run(
+            result.blocker or "run handoff started but not verified complete"
+        )
+        if not reopened:
+            return result
+        if store is not None:
+            store.save(state)
+        return replace(result, resume_capability=state.resume_capability())
+    if result.status == "failed":
+        # Genuine failure: persist a durable FAILED terminal so --resume/--status
+        # never report success, but do NOT reopen to RUN and do NOT advertise
+        # resume — the reconciled NONE capability is authoritative for failures.
+        if (
+            state.close_completed_run_handoff_as_failed(
+                result.blocker or "run execution finished unsuccessfully"
+            )
+            and store is not None
+        ):
+            store.save(state)
+        return result
+    return result
+
+
+async def _await_run_handoff_terminal(
+    result: AutoPipelineResult,
+    *,
+    job_manager: JobManager | None,
+    event_store: EventStore | None,
+    quiet: bool,
+    deadline_at: float | None = None,
+    fallback_timeout_seconds: float = DEFAULT_PIPELINE_TIMEOUT_SECONDS,
+    state: AutoPipelineState | None = None,
+    store: AutoStore | None = None,
+) -> AutoPipelineResult:
+    """Wait for the started execute job to finish, streaming run progress.
+
+    Returns the original ``result`` unchanged when there is nothing to wait on
+    (no job handle, or the job is not owned by this manager — e.g. a plugin
+    dispatch). Otherwise polls the live job manager to a terminal state, prints
+    the run receipt via the existing ``ouroboros_job_result`` renderer, and
+    reconciles the run verdict onto the returned result.
+
+    The wait is bounded by ``deadline_at`` — the pipeline's armed monotonic
+    deadline (``state.deadline_at``), i.e. the SAME budget the CLI's top-level
+    ``--timeout`` contract advertises; the pipeline consumed part of it and the
+    wait gets the remainder. When no deadline was armed (defensive), a fresh
+    ``fallback_timeout_seconds`` window (the pipeline's own default budget)
+    applies — the wait is never unbounded. On expiry the job is cancelled
+    cleanly via the existing cancel path and a bounded blocked/timeout verdict
+    is returned, mirroring the Ctrl-C semantics.
+
+    When ``state`` / ``store`` are provided, a non-success verdict also
+    corrects the DURABLE auto state (out of the pipeline's premature COMPLETE)
+    so a later ``--resume`` reconciles the run rather than returning stale
+    product-complete.
+    """
+    job_id = result.job_id
+    if not job_id or job_manager is None or event_store is None:
+        return result
+    try:
+        snapshot = await job_manager.get_snapshot(job_id)
+    except ValueError:
+        # Job handle not owned by this manager (e.g. plugin-mode dispatch):
+        # honestly leave the handoff-only result as-is for the caller to render.
+        return result
+
+    deadline = (
+        deadline_at
+        if deadline_at is not None
+        else time.monotonic() + max(0.0, fallback_timeout_seconds)
+    )
+    if not quiet:
+        print_info(
+            f"Waiting for run job {job_id} to finish "
+            "(Ctrl-C cancels the run; resumable with ooo auto --resume)..."
+        )
+    wait_handler = JobWaitHandler(job_manager=job_manager, event_store=event_store)
+    cursor = 0
+    last_line = ""
+    try:
+        while not snapshot.is_terminal:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                deadline_result = await _cancel_run_and_build_deadline_result(
+                    result, job_manager, job_id, snapshot
+                )
+                return _persist_resumable_run_verdict(deadline_result, state, store)
+            try:
+                wait_result = await asyncio.wait_for(
+                    wait_handler.handle(
+                        {
+                            "job_id": job_id,
+                            "cursor": cursor,
+                            "timeout_seconds": _RUN_HANDOFF_WAIT_POLL_SECONDS,
+                            "view": "compact",
+                            "wait_for": "ac_change",
+                        }
+                    ),
+                    timeout=min(float(_RUN_HANDOFF_WAIT_POLL_SECONDS), remaining),
+                )
+            except TimeoutError:
+                # Poll window clipped by the deadline; loop re-checks it.
+                continue
+            if wait_result.is_err:
+                break
+            value = wait_result.value
+            meta = value.meta or {}
+            with contextlib.suppress(TypeError, ValueError):
+                cursor = int(meta.get("cursor", cursor))
+            line = (value.text_content or "").strip()
+            if not quiet and meta.get("changed") and line and line != last_line:
+                last_line = line
+                console.print(rf"[dim]\[run][/] {_rich_escape(line)}")
+            if meta.get("is_terminal"):
+                break
+            snapshot = await job_manager.get_snapshot(job_id)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Interrupt cancels the run mid-flight — the same non-success boundary
+        # as the deadline/paused/terminal-failure paths. Correct the durable
+        # state FIRST (synchronous, so it always lands even if the cancel await
+        # below is itself interrupted) so a later ``ouroboros auto --resume``
+        # reconciles the cancelled run instead of returning the pipeline's
+        # premature COMPLETE. Best-effort: never let a persistence hiccup mask
+        # the operator's interrupt.
+        with contextlib.suppress(Exception):
+            interrupted_result = replace(
+                result,
+                status="blocked",
+                blocker=(
+                    f"run cancelled by interrupt; cancelled run job {job_id}. "
+                    "The product run did NOT complete. Resume with: "
+                    f"ouroboros auto --resume {result.auto_session_id}"
+                ),
+                resume_capability=AutoResumeCapability.RESUME,
+            )
+            _persist_resumable_run_verdict(interrupted_result, state, store)
+        await _cancel_run_handoff_job(job_manager, job_id)
+        print_warning(
+            f"Interrupted — cancelled run job {job_id}. "
+            f"Resume with: ouroboros auto --resume {result.auto_session_id}"
+        )
+        raise
+
+    snapshot = await job_manager.get_snapshot(job_id)
+    if not quiet:
+        result_handler = JobResultHandler(job_manager=job_manager, event_store=event_store)
+        receipt = await result_handler.handle({"job_id": job_id})
+        if receipt.is_ok and receipt.value.text_content:
+            console.print(receipt.value.text_content)
+    reconciled = _reconcile_run_handoff_result(result, snapshot)
+    return _persist_resumable_run_verdict(reconciled, state, store)
 
 
 def _print_detached_guidance(result: AutoPipelineResult) -> None:

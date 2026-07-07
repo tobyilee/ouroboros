@@ -747,6 +747,88 @@ class AutoPipelineState:
         self.last_tool_name = tool_name
         self.transition(AutoPhase.FAILED, message, error=message)
 
+    def reopen_completed_run_handoff_to_run(self, message: str) -> bool:
+        """Reopen a prematurely-COMPLETE run handoff back to the RUN phase.
+
+        ``AutoPipeline.run`` persists ``COMPLETE`` immediately after a run
+        handoff is *dispatched* (to avoid duplicate run starts on resume), but
+        that COMPLETE is not verified product completion. When a caller later
+        observes the execute job finish paused / unsuccessfully / cancelled (for
+        example the CLI in-process wait), the durable state must be corrected so
+        a later ``--resume`` reconciles the owned run job instead of returning
+        the stale COMPLETE (the ``pipeline.run`` COMPLETE fast-path returns
+        immediately for ``AutoPhase.COMPLETE``).
+
+        ``_ALLOWED_TRANSITIONS`` has no ``COMPLETE -> *`` edge by design — auto
+        never *advances* out of COMPLETE — so this corrective re-open sets the
+        phase directly rather than via :meth:`transition`. It is a no-op (returns
+        ``False``) unless the state is currently ``COMPLETE``; the run handles
+        (``job_id`` / ``execution_id`` / ``run_session_id``) and
+        ``run_handoff_status`` are left intact so the RUN-phase resume path can
+        reconcile the owned job. ``last_tool_name`` is set to ``"run_starter"``
+        so the state classifies as RUN-recoverable (resumable).
+
+        The absolute pipeline deadline (``deadline_at`` / ``deadline_at_epoch``)
+        is CLEARED. The premature COMPLETE was often reached because the wait's
+        own deadline expired, so the persisted absolute deadline is already
+        past; leaving it would make ``--resume`` hit ``AutoPipeline.run``'s
+        deadline gate (which fires on an expired deadline BEFORE the RUN
+        reconciliation) and immediately re-block with ``pipeline_timeout`` —
+        turning the advertised resume into a dead end. Clearing both fields lets
+        ``AutoPipelineState.from_dict`` re-arm a fresh budget on the next load
+        (its non-terminal re-arm path), so a fresh resume gets a fresh deadline.
+        """
+        if self.phase is not AutoPhase.COMPLETE:
+            return False
+        now = utc_now_iso()
+        self.phase = AutoPhase.RUN
+        self.phase_started_at = now
+        self.last_progress_at = now
+        self.updated_at = now
+        self.last_progress_message = message
+        self.last_error = None
+        self.last_error_code = None
+        self.last_tool_name = "run_starter"
+        self.last_authoring_backend = None
+        self.deadline_at = None
+        self.deadline_at_epoch = None
+        return True
+
+    def close_completed_run_handoff_as_failed(self, message: str) -> bool:
+        """Correct a prematurely-COMPLETE run handoff into a FAILED terminal.
+
+        Companion to :meth:`reopen_completed_run_handoff_to_run` for the
+        *genuine failure* case (the owned execute job reached a FAILED terminal
+        or reported ``success is False``). Unlike a paused / cancelled /
+        deadline outcome — which is resumable and re-opens to ``RUN`` — a
+        genuine failure must preserve a non-resumable failed terminal contract:
+        ``--resume`` must NOT retry it and must NOT report the run as complete.
+
+        Sets the phase directly to ``FAILED`` (``COMPLETE`` has no forward
+        transition edge, matching :meth:`reopen_completed_run_handoff_to_run`)
+        and sets ``last_tool_name = None`` so :meth:`resume_capability`
+        classifies the state as :attr:`AutoResumeCapability.NONE`
+        (``_recoverable_phase_for_tool(None)`` is ``None``). The run handles are
+        left intact for diagnostics. No-op (returns ``False``) unless the state
+        is currently ``COMPLETE``.
+        """
+        if self.phase is not AutoPhase.COMPLETE:
+            return False
+        now = utc_now_iso()
+        self.phase = AutoPhase.FAILED
+        self.phase_started_at = now
+        self.last_progress_at = now
+        self.updated_at = now
+        self.last_progress_message = message
+        self.last_error = message
+        self.last_error_code = None
+        # Intentionally not "run_starter": a genuine run failure is a terminal
+        # dead end, not a RUN-recoverable blocker, so resume_capability() must
+        # resolve to NONE rather than routing back into the RUN phase.
+        self.last_tool_name = None
+        self.last_authoring_backend = None
+        return True
+
     def is_terminal(self) -> bool:
         """Return True when the state cannot continue automatically."""
         return self.phase in TERMINAL_PHASES
